@@ -2,10 +2,10 @@ export const config = { runtime: 'edge' };
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-// Fast models tried in order (fallback on 429 rate limits)
+// Fast models tried in order (fallback on 429/400 errors)
 const FAST_MODELS = [
 	'stepfun/step-3.5-flash:free',
-	'z-ai/glm-4.5-air:free',
+	'arcee-ai/trinity-mini:free',
 	'nvidia/nemotron-3-nano-30b-a3b:free',
 ];
 const FULL_MODELS = [
@@ -107,6 +107,7 @@ function streamLLMResponse(apiRes, transformChunk) {
 	return readable;
 }
 
+// Race all models in parallel — first successful streamed response wins
 async function callLLM(
 	apiKey,
 	models,
@@ -114,8 +115,32 @@ async function callLLM(
 	userMessage,
 	maxTokens = 4096,
 ) {
-	let lastRes;
-	for (const model of models) {
+	if (models.length === 1) {
+		const res = await fetch(OPENROUTER_URL, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				'Content-Type': 'application/json',
+				'HTTP-Referer': 'https://github.com/kylehgc/we-dont-need-no-web-dev',
+				'X-Title': 'we-dont-need-no-web-dev',
+			},
+			body: JSON.stringify({
+				model: models[0],
+				messages: [
+					{ role: 'system', content: systemPrompt },
+					{ role: 'user', content: userMessage },
+				],
+				max_tokens: maxTokens,
+				temperature: 1.2,
+				stream: true,
+			}),
+		});
+		res.modelUsed = models[0];
+		return res;
+	}
+
+	// Fire all models at once, resolve when first one returns a good response
+	const racePromises = models.map(async (model) => {
 		const res = await fetch(OPENROUTER_URL, {
 			method: 'POST',
 			headers: {
@@ -135,20 +160,46 @@ async function callLLM(
 				stream: true,
 			}),
 		});
-		lastRes = res;
-		if (res.status === 429 && model !== models[models.length - 1]) {
-			continue; // rate-limited, try next model
+		if (res.status === 429 || res.status === 400) {
+			throw new Error(`${model} returned ${res.status}`);
 		}
 		res.modelUsed = model;
 		return res;
+	});
+
+	try {
+		return await Promise.any(racePromises);
+	} catch {
+		// All models failed — fall back to sequential last-resort
+		const res = await fetch(OPENROUTER_URL, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				'Content-Type': 'application/json',
+				'HTTP-Referer': 'https://github.com/kylehgc/we-dont-need-no-web-dev',
+				'X-Title': 'we-dont-need-no-web-dev',
+			},
+			body: JSON.stringify({
+				model: models[0],
+				messages: [
+					{ role: 'system', content: systemPrompt },
+					{ role: 'user', content: userMessage },
+				],
+				max_tokens: maxTokens,
+				temperature: 1.2,
+				stream: true,
+			}),
+		});
+		res.modelUsed = models[0];
+		return res;
 	}
-	lastRes.modelUsed = models[models.length - 1];
-	return lastRes;
 }
 
 // HTML wrapper that streams the /docs/ text into a styled terminal-like page
+// The padding comment pushes the initial chunk past mobile browser buffering thresholds (~1KB)
 const DOCS_HTML_PREFIX = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>docs — how does this cursed site work?</title>
+<!-- ${'x'.repeat(1024)} -->
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0a0a0a;color:#00ff41;font-family:'Courier New',monospace;padding:2rem;line-height:1.7}
@@ -236,6 +287,7 @@ export default async function handler(request) {
 			return new Response(readable, {
 				headers: {
 					'Content-Type': 'text/html; charset=utf-8',
+					'X-Content-Type-Options': 'nosniff',
 					'X-Powered-By': 'vibes',
 					'X-Model': res.modelUsed || 'unknown',
 				},
@@ -273,6 +325,7 @@ export default async function handler(request) {
 		return new Response(readable, {
 			headers: {
 				'Content-Type': 'text/html; charset=utf-8',
+				'X-Content-Type-Options': 'nosniff',
 				'X-Powered-By': 'vibes',
 				'X-Model': res.modelUsed || 'unknown',
 			},
