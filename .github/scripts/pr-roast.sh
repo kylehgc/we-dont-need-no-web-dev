@@ -88,7 +88,7 @@ Best viewed in Netscape Navigator 4.0 at 800x600 resolution.
 fi
 
 {
-  echo '## :sparkles: AI PR Review from the Information Superhighway :sparkles:'
+  echo '## *~*~* AI PR Review from the Information Superhighway *~*~*'
   echo ''
   echo "$RESPONSE"
   echo ''
