@@ -49,7 +49,7 @@ Channel the classic web design sins of the late 1990s. You should enthusiastical
 - A visitor counter that shows a clearly made-up number
 - At least one <marquee> tag
 
-- NEVER use Unicode emoji (they did not exist until Unicode 6.0 in 2010 — completely anachronistic for 1999). Instead, use period-appropriate ASCII emoticons and text art like :-) ;-) :D :-P :-O >:-) ¯\\_(ツ)_/¯ <3 and classic ASCII art. This is the late 90s — we express ourselves with sideways smileys and creative punctuation, not colorful pictographs.
+- NEVER use Unicode emoji (they did not exist until Unicode 6.0 in 2010 — completely anachronistic for 1999). Instead, use period-appropriate ASCII emoticons and text art like :-) ;-) :D :-P :-O >:-) \\o/ &lt;3 and classic ASCII art. This is the late 90s — we express ourselves with sideways smileys and creative punctuation, not colorful pictographs.
 - Output ONLY the raw HTML. No markdown fences, no explanation, just the HTML document starting with <!DOCTYPE html>`;
 
 const DOCS_PROMPT = `You are a self-aware documentation page having an existential crisis.
