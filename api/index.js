@@ -86,8 +86,11 @@ IMPORTANT: Do NOT use Unicode emoji anywhere — they are anachronistic (emoji w
 // Stream tokens from OpenRouter and pipe through a transform.
 // When injectBeforeClose is provided, the last TAIL_SIZE characters are buffered
 // so the injection string can be inserted before </body> or </html>.
-function streamLLMResponse(apiRes, transformChunk, injectBeforeClose) {
+// When injectInHead is provided, a small scanning buffer detects </head> early
+// in the stream and inserts the string just before it.
+function streamLLMResponse(apiRes, transformChunk, injectBeforeClose, injectInHead) {
 	const TAIL_SIZE = 30;
+	const HEAD_WINDOW = 6; // length of "</head"
 	const { readable, writable } = new TransformStream();
 	const writer = writable.getWriter();
 	const encoder = new TextEncoder();
@@ -97,6 +100,8 @@ function streamLLMResponse(apiRes, transformChunk, injectBeforeClose) {
 		const reader = apiRes.body.getReader();
 		let buffer = '';
 		let tail = '';
+		let headBuf = '';
+		let headInjected = !injectInHead;
 
 		try {
 			while (true) {
@@ -117,7 +122,25 @@ function streamLLMResponse(apiRes, transformChunk, injectBeforeClose) {
 						const json = JSON.parse(data);
 						const token = json.choices?.[0]?.delta?.content;
 						if (token) {
-							const output = transformChunk ? transformChunk(token) : token;
+							let output = transformChunk ? transformChunk(token) : token;
+
+							// Scan for </head> to inject model metadata
+							if (!headInjected) {
+								headBuf += output;
+								const lower = headBuf.toLowerCase();
+								const idx = lower.indexOf('</head');
+								if (idx !== -1) {
+									output = headBuf.slice(0, idx) + injectInHead + headBuf.slice(idx);
+									headBuf = '';
+									headInjected = true;
+								} else if (headBuf.length > HEAD_WINDOW) {
+									output = headBuf.slice(0, headBuf.length - HEAD_WINDOW);
+									headBuf = headBuf.slice(headBuf.length - HEAD_WINDOW);
+								} else {
+									continue;
+								}
+							}
+
 							if (injectBeforeClose) {
 								tail += output;
 								if (tail.length > TAIL_SIZE) {
@@ -143,6 +166,16 @@ function streamLLMResponse(apiRes, transformChunk, injectBeforeClose) {
 				),
 			);
 		} finally {
+			// Flush any remaining head-scan buffer
+			if (headBuf) {
+				if (injectBeforeClose) {
+					tail += headBuf;
+				} else {
+					await writer.write(encoder.encode(headBuf));
+				}
+				headBuf = '';
+			}
+
 			if (injectBeforeClose && tail) {
 				const lower = tail.toLowerCase();
 				const idx = lower.lastIndexOf('</body');
@@ -166,8 +199,10 @@ function streamLLMResponse(apiRes, transformChunk, injectBeforeClose) {
 }
 
 // The padding comment pushes the initial chunk past mobile browser buffering thresholds (~1KB).
-const DOCS_HTML_PREFIX = `<!DOCTYPE html>
+function docsHtmlPrefix(modelName) {
+	return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>docs — how does this cursed site work?</title>
+<meta name="x-model" content="${escapeHtml(modelName)}">
 <!-- ${'x'.repeat(1024)} -->
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -179,6 +214,7 @@ h1{text-align:center;font-size:1.4rem;margin-bottom:2rem;color:#00ff41;text-shad
 </style></head><body>
 <h1>$ cat /docs/how-this-works.txt</h1>
 <pre>`;
+}
 
 const ANALYTICS_SCRIPT = `<script defer src="/_vercel/insights/script.js"></script>`;
 
@@ -229,6 +265,7 @@ function emergencyPageHtml(path, failureSummary) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="x-model" content="emergency-static-fallback">
 <title>emergency homepage generator backup</title>
 <style>
 :root{--bg1:#1b0036;--bg2:#003b59;--ink:#fff5a8;--hot:#ff5e9c;--acid:#7dff7a;--panel:rgba(0,0,0,.52)}
@@ -430,7 +467,7 @@ export default async function handler(request) {
 			if (!res) {
 				const failureSummary = buildFailureSummary(failures);
 				return new Response(
-					`${DOCS_HTML_PREFIX}${escapeHtml(emergencyDocsText(failureSummary))}${DOCS_HTML_SUFFIX}`,
+					`${docsHtmlPrefix('emergency-docs-fallback')}${escapeHtml(emergencyDocsText(failureSummary))}${DOCS_HTML_SUFFIX}`,
 					{
 						headers: {
 							'Content-Type': 'text/html; charset=utf-8',
@@ -449,7 +486,7 @@ export default async function handler(request) {
 			const encoder = new TextEncoder();
 
 			(async () => {
-				await writer.write(encoder.encode(DOCS_HTML_PREFIX));
+				await writer.write(encoder.encode(docsHtmlPrefix(res.modelUsed || 'unknown')));
 
 				const innerStream = streamLLMResponse(res, escapeHtml);
 				const reader = innerStream.getReader();
@@ -519,7 +556,8 @@ export default async function handler(request) {
 			});
 		}
 
-		const readable = streamLLMResponse(res, null, ANALYTICS_SCRIPT);
+		const modelMeta = `<meta name="x-model" content="${escapeHtml(res.modelUsed || 'unknown')}">`;
+		const readable = streamLLMResponse(res, null, ANALYTICS_SCRIPT, modelMeta);
 		return new Response(readable, {
 			headers: {
 				'Content-Type': 'text/html; charset=utf-8',
