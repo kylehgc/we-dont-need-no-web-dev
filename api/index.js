@@ -235,7 +235,7 @@ function buildOpenRouterBody(model, systemPrompt, userMessage, maxTokens) {
 		temperature: 1.2,
 		stream: true,
 	});
-}
+}0.7
 
 function shouldFallbackStatus(status) {
 	return (
