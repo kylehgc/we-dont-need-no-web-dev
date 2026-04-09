@@ -49,6 +49,7 @@ Channel the classic web design sins of the late 1990s. You should enthusiastical
 - A visitor counter that shows a clearly made-up number
 - At least one <marquee> tag
 
+- NEVER use Unicode emoji (they did not exist until Unicode 6.0 in 2010 — completely anachronistic for 1999). Instead, use period-appropriate ASCII emoticons and text art like :-) ;-) :D :-P :-O >:-) ¯\\_(ツ)_/¯ <3 and classic ASCII art. This is the late 90s — we express ourselves with sideways smileys and creative punctuation, not colorful pictographs.
 - Output ONLY the raw HTML. No markdown fences, no explanation, just the HTML document starting with <!DOCTYPE html>`;
 
 const DOCS_PROMPT = `You are a self-aware documentation page having an existential crisis.
@@ -78,7 +79,9 @@ Write a stream-of-consciousness documentation page as plain text (NOT HTML). You
 
 Always write in English.
 
-Do NOT write HTML. Just write raw text. Be funny. Be weird. Be memorable. You only get one shot at existence — make it count.`;
+Do NOT write HTML. Just write raw text. Be funny. Be weird. Be memorable. You only get one shot at existence — make it count.
+
+IMPORTANT: Do NOT use Unicode emoji anywhere — they are anachronistic (emoji were not added to Unicode until 2010). Use classic ASCII emoticons instead: :-) ;-) :D :-P :-O >:-) <3 and so on. You are a product of 1999 — act like it.`;
 
 // Stream tokens from OpenRouter and pipe through a transform.
 // When injectBeforeClose is provided, the last TAIL_SIZE characters are buffered
