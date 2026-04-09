@@ -85,7 +85,12 @@ Do NOT write HTML. Just write raw text. Be funny. Be weird. Be memorable. You on
 // so the injection string can be inserted before </body> or </html>.
 // When injectInHead is provided, a small scanning buffer detects </head> early
 // in the stream and inserts the string just before it.
-function streamLLMResponse(apiRes, transformChunk, injectBeforeClose, injectInHead) {
+function streamLLMResponse(
+	apiRes,
+	transformChunk,
+	injectBeforeClose,
+	injectInHead,
+) {
 	const TAIL_SIZE = 30;
 	const HEAD_WINDOW = 6; // length of "</head"
 	const { readable, writable } = new TransformStream();
@@ -127,7 +132,8 @@ function streamLLMResponse(apiRes, transformChunk, injectBeforeClose, injectInHe
 								const lower = headBuf.toLowerCase();
 								const idx = lower.indexOf('</head');
 								if (idx !== -1) {
-									output = headBuf.slice(0, idx) + injectInHead + headBuf.slice(idx);
+									output =
+										headBuf.slice(0, idx) + injectInHead + headBuf.slice(idx);
 									headBuf = '';
 									headInjected = true;
 								} else if (headBuf.length > HEAD_WINDOW) {
@@ -229,7 +235,7 @@ function buildOpenRouterBody(model, systemPrompt, userMessage, maxTokens) {
 			{ role: 'user', content: userMessage },
 		],
 		max_tokens: maxTokens,
-		temperature: 1.2,
+		temperature: 0.7,
 		stream: true,
 	});
 }
@@ -483,7 +489,9 @@ export default async function handler(request) {
 			const encoder = new TextEncoder();
 
 			(async () => {
-				await writer.write(encoder.encode(docsHtmlPrefix(res.modelUsed || 'unknown')));
+				await writer.write(
+					encoder.encode(docsHtmlPrefix(res.modelUsed || 'unknown')),
+				);
 
 				const innerStream = streamLLMResponse(res, escapeHtml);
 				const reader = innerStream.getReader();
