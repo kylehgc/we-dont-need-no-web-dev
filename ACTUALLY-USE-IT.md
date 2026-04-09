@@ -80,17 +80,22 @@ Then redeploy: `vercel --prod`
 
 ## Free Models (Fallback Chain)
 
-The site tries these models in order. If one returns a 429 (rate limit), it falls through to the next:
+The site tries these models in order. If one times out, disappears, rate-limits, or has an upstream meltdown, it falls through to the next:
 
 **Fast (default):**
 
-1. `stepfun/step-3.5-flash:free`
-2. `z-ai/glm-4.5-air:free`
-3. `nvidia/nemotron-3-nano-30b-a3b:free`
+1. `z-ai/glm-4.5-air:free`
+2. `nvidia/nemotron-3-nano-30b-a3b:free`
+3. `minimax/minimax-m2.5:free`
+4. `openai/gpt-oss-120b:free`
 
 **Full (`?long=true`):**
 
 1. `nvidia/nemotron-3-super-120b-a12b:free`
-2. `stepfun/step-3.5-flash:free`
+2. `openai/gpt-oss-120b:free`
+3. `minimax/minimax-m2.5:free`
+4. `z-ai/glm-4.5-air:free`
 
 Check [openrouter.ai/models?q=free](https://openrouter.ai/models?q=free) for the current free model list — these change over time.
+
+If every model in the chain fails, the server returns a built-in emergency page or docs page so the request still succeeds with something human-readable.
