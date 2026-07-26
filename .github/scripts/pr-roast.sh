@@ -6,9 +6,11 @@ set -euo pipefail
 PR_JSON=$(gh pr view "$PR_NUMBER" --json title,body,files \
   --jq '{title: .title, body: .body, files: [.files[].path]}')
 
-PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
-PR_BODY=$(echo "$PR_JSON" | jq -r '.body')
-PR_FILES=$(echo "$PR_JSON" | jq -r '.files | join(", ")')
+# Truncate: title/body are attacker-controlled on a public repo, and an
+# unbounded body is a free prompt-stuffing vector (and token burn).
+PR_TITLE=$(echo "$PR_JSON" | jq -r '.title' | head -c 300)
+PR_BODY=$(echo "$PR_JSON" | jq -r '.body' | head -c 2000)
+PR_FILES=$(echo "$PR_JSON" | jq -r '.files | join(", ")' | head -c 1000)
 
 # Same free models the site uses, tried in order
 MODELS=(

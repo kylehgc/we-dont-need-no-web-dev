@@ -2,7 +2,9 @@ name: AI PR Roast Bot
 
 "on":
   pull_request_target:
-    types: [opened, synchronize]
+    # opened only: one roast per PR. Re-roast a revised PR manually via
+    # workflow_dispatch instead of burning a model call on every push.
+    types: [opened]
   workflow_dispatch:
     inputs:
       pr_number:

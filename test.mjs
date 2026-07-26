@@ -29,6 +29,21 @@ function stubFetch(chunks, { ok = true, status = 200 } = {}) {
 		new Response(ok ? sseStream(chunks) : 'nope', { status });
 }
 
+// Recording stub: captures every request (auth, model, messages) and lets each
+// call succeed or fail independently. `plan` maps call index -> {ok, chunks}.
+function recordingFetch(plan) {
+	const calls = [];
+	globalThis.fetch = async (url, opts) => {
+		const body = JSON.parse(opts.body);
+		calls.push({ auth: opts.headers.Authorization, body });
+		const step = plan[Math.min(calls.length - 1, plan.length - 1)];
+		return new Response(step.ok ? sseStream(step.chunks) : 'nope', {
+			status: step.ok ? 200 : step.status || 429,
+		});
+	};
+	return calls;
+}
+
 function ctx(url, env = {}) {
 	const pending = [];
 	return {
@@ -176,6 +191,179 @@ await check('all models failing serves the emergency page', async () => {
 	const res = await onRequest(c);
 	assert.strictEqual(res.headers.get('X-Model'), 'emergency-static-fallback');
 	assert.match(await res.text(), /LLM OUTAGE/);
+});
+
+const PAGE = ['<!DOCTYPE html><html><head></head><body>ok</body></html>'];
+
+await check('healthy first model costs exactly one request', async () => {
+	const calls = recordingFetch([{ ok: true, chunks: PAGE }]);
+	const c = ctx('https://x.dev/quota-check', KEY);
+	await (await onRequest(c)).text();
+	await Promise.all(c.pending);
+	assert.strictEqual(calls.length, 1, `hedge regressed: ${calls.length} requests for one page view`);
+});
+
+await check('failed lane opens the next immediately, reports the loser', async () => {
+	const t0 = Date.now();
+	const calls = recordingFetch([
+		{ ok: false, status: 429 },
+		{ ok: true, chunks: PAGE },
+	]);
+	const c = ctx('https://x.dev/failover', KEY);
+	const res = await onRequest(c);
+	await res.text();
+	await Promise.all(c.pending);
+	assert.strictEqual(calls.length, 2);
+	assert.strictEqual(res.headers.get('X-Model'), calls[1].body.model);
+	assert.match(res.headers.get('X-LLM-Failures'), /429/);
+	assert.ok(Date.now() - t0 < 1500, 'failover waited for the stagger timer instead of advancing on failure');
+});
+
+await check('?model= failure surfaces upstream status, no fallback', async () => {
+	const calls = recordingFetch([{ ok: false, status: 418 }]);
+	const c = ctx('https://x.dev/x?model=someone/weird-model', KEY);
+	const res = await onRequest(c);
+	assert.strictEqual(calls.length, 1, 'custom model must not fall back to the free chain');
+	assert.strictEqual(calls[0].body.model, 'someone/weird-model');
+	assert.strictEqual(res.status, 418);
+	assert.match(await res.text(), /Server error/);
+});
+
+await check('?key= is used for auth and stripped from the prompt; ?long= picks FULL_MODELS', async () => {
+	const calls = recordingFetch([{ ok: true, chunks: PAGE }]);
+	const c = ctx('https://x.dev/some/page?key=sk-or-v1-visitor&long=true&vibe=maximal', {});
+	await (await onRequest(c)).text();
+	await Promise.all(c.pending);
+	assert.strictEqual(calls[0].auth, 'Bearer sk-or-v1-visitor');
+	const userMsg = calls[0].body.messages[1].content;
+	assert.ok(!userMsg.includes('sk-or-v1'), 'key leaked into the prompt');
+	assert.ok(!userMsg.includes('long=true'), 'long= leaked into the prompt');
+	assert.match(userMsg, /vibe=maximal/);
+	assert.match(calls[0].body.model, /nemotron-3-super/, 'long=true should start with the FULL_MODELS chain');
+});
+
+await check('docs output is HTML-escaped against a hostile model', async () => {
+	stubFetch(['<script>alert(1)</script>', ' & "quotes"']);
+	const c = ctx('https://x.dev/docs/', KEY);
+	const html = await (await onRequest(c)).text();
+	await Promise.all(c.pending);
+	assert.ok(!html.includes('<script>alert'), 'raw script tag reached the page');
+	assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+	assert.match(html, /&amp; &quot;quotes&quot;/);
+});
+
+await check('malformed SSE lines are skipped, valid ones still stream', async () => {
+	const encoder = new TextEncoder();
+	globalThis.fetch = async () =>
+		new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(encoder.encode('data: {not json}\n'));
+					controller.enqueue(encoder.encode(': keep-alive comment\n'));
+					const payload = { choices: [{ delta: { content: '<html><head></head><body>survived</body></html>' } }] };
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n`));
+					controller.enqueue(encoder.encode('data: [DONE]\n'));
+					controller.close();
+				},
+			}),
+		);
+	const c = ctx('https://x.dev/messy', KEY);
+	const html = await (await onRequest(c)).text();
+	await Promise.all(c.pending);
+	assert.match(html, /<body>survived<\/body>/);
+});
+
+await check('[DONE] ends the response even if the provider never closes the socket', async () => {
+	const encoder = new TextEncoder();
+	globalThis.fetch = async () =>
+		new Response(
+			new ReadableStream({
+				start(controller) {
+					const payload = { choices: [{ delta: { content: '<html><head></head><body>done</body></html>' } }] };
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n`));
+					controller.enqueue(encoder.encode('data: [DONE]\n'));
+					// Deliberately never close() — a lingering provider socket.
+				},
+			}),
+		);
+	const c = ctx('https://x.dev/lingering', KEY);
+	const html = await Promise.race([
+		(await onRequest(c)).text(),
+		new Promise((_, rej) => setTimeout(() => rej(new Error('response never ended after [DONE]')), 3000)),
+	]);
+	assert.match(html, /<body>done<\/body>/);
+});
+
+await check('final token without trailing newline is not dropped', async () => {
+	const encoder = new TextEncoder();
+	const payload = { choices: [{ delta: { content: '<html><head></head><body>tail</body></html>' } }] };
+	globalThis.fetch = async () =>
+		new Response(
+			new ReadableStream({
+				start(controller) {
+					// No trailing \n and no [DONE] — stream just ends mid-line.
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}`));
+					controller.close();
+				},
+			}),
+		);
+	const c = ctx('https://x.dev/no-newline', KEY);
+	const html = await (await onRequest(c)).text();
+	await Promise.all(c.pending);
+	assert.match(html, /<body>tail<\/body>/);
+});
+
+await check('zero-token 200 serves the emergency page, not a blank 200', async () => {
+	stubFetch([]); // opens fine, closes with [DONE] and no content tokens
+	const c = ctx('https://x.dev/empty-win', KEY);
+	const res = await onRequest(c);
+	assert.strictEqual(res.headers.get('X-LLM-Fallback'), 'first-byte-timeout');
+	assert.match(await res.text(), /LLM OUTAGE/);
+});
+
+await check('scanner probes get a cheap 404 and never touch the model', async () => {
+	let fetches = 0;
+	globalThis.fetch = async () => {
+		fetches++;
+		return new Response(sseStream(PAGE), { status: 200 });
+	};
+	for (const p of ['/wp-login.php', '/.env', '/xmlrpc.php', '/config.yml', '/.git/config', '/sitemap.xml']) {
+		const res = await onRequest(ctx('https://x.dev' + p, KEY));
+		assert.strictEqual(res.status, 404, p + ' should 404');
+	}
+	assert.strictEqual(fetches, 0, 'a scanner probe reached OpenRouter');
+	// And absurd legit paths still generate:
+	const res = await onRequest(ctx('https://x.dev/ceo/of/sandwiches', KEY));
+	assert.strictEqual(res.status, 200);
+});
+
+await check('CSP blocks scripts by default, allows only the beacon when analytics is on', async () => {
+	stubFetch(PAGE);
+	let c = ctx('https://x.dev/', KEY);
+	let res = await onRequest(c);
+	await res.text();
+	await Promise.all(c.pending);
+	let csp = res.headers.get('Content-Security-Policy');
+	assert.match(csp, /default-src 'none'/);
+	assert.ok(!csp.includes('script-src'), 'no analytics -> no script source at all');
+
+	stubFetch(PAGE);
+	c = ctx('https://x.dev/', { ...KEY, CF_BEACON_TOKEN: 'tok' });
+	res = await onRequest(c);
+	await res.text();
+	await Promise.all(c.pending);
+	csp = res.headers.get('Content-Security-Policy');
+	assert.match(csp, /script-src https:\/\/static\.cloudflareinsights\.com/);
+});
+
+await check('hostile ?model= cannot crash header assembly', async () => {
+	recordingFetch([{ ok: false, status: 400 }]);
+	const evil = encodeURIComponent('bad\r\nSet-Cookie: pwned=1\u{1F600}');
+	const res = await onRequest(ctx(`https://x.dev/x?model=${evil}`, KEY));
+	assert.ok(res.status >= 400, 'should surface an error status');
+	assert.strictEqual(res.headers.get('Set-Cookie'), null, 'header injection');
+	const failures = res.headers.get('X-LLM-Failures') || '';
+	assert.ok(!/[\r\n]/.test(failures));
 });
 
 console.log(results.join('\n'));

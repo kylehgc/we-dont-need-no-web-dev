@@ -5,6 +5,17 @@ const OPENROUTER_HEADERS = {
 	'X-Title': 'we-dont-need-no-web-dev',
 };
 const OPENROUTER_TIMEOUT_MS = 12000;
+// How long the winning model gets to produce its first token before we give up
+// and serve the emergency page instead of holding a headerless request open.
+const FIRST_BYTE_TIMEOUT_MS = 15000;
+// A lane of the model race opens this long after the previous one, unless the
+// previous lane has already failed outright (then the next opens immediately).
+const HEDGE_MS = 2000;
+
+// Classic vuln-scanner probe shapes: server-side extensions this site will
+// never have, plus WordPress/phpMyAdmin prefixes and dotfile paths.
+const SCANNER_PATHS =
+	/\.(php\d?|aspx?|jsp|cgi|env|git|sql|bak|ini|config|ya?ml|lock|axd|xml)$|^\/(wp-|wordpress|phpmyadmin|xmlrpc|cgi-bin|vendor\/|\.)/i;
 
 // Free model availability drifts constantly, so spread across multiple providers.
 // Ordered by latency / throughput — fastest first so the happy path is snappy.
@@ -106,9 +117,64 @@ function streamLLMResponse(
 		let tail = '';
 		let headBuf = '';
 		let headInjected = !injectInHead;
+		let sawDone = false;
+
+		// Route one token's worth of output through the head-scan and tail
+		// buffers; returns the substring that is ready to leave the function.
+		const absorb = (output) => {
+			if (!headInjected) {
+				headBuf += output;
+				const idx = headBuf.toLowerCase().indexOf('</head');
+				if (idx !== -1) {
+					output = headBuf.slice(0, idx) + injectInHead + headBuf.slice(idx);
+					headBuf = '';
+					headInjected = true;
+				} else if (headBuf.length > HEAD_WINDOW) {
+					output = headBuf.slice(0, headBuf.length - HEAD_WINDOW);
+					headBuf = headBuf.slice(headBuf.length - HEAD_WINDOW);
+				} else {
+					return '';
+				}
+			}
+
+			if (injectBeforeClose) {
+				tail += output;
+				if (tail.length <= TAIL_SIZE) return '';
+				const flush = tail.slice(0, tail.length - TAIL_SIZE);
+				tail = tail.slice(tail.length - TAIL_SIZE);
+				return flush;
+			}
+			return output;
+		};
+
+		const drainLines = (lines) => {
+			// One encoded write per network chunk, not per token — the per-token
+			// writes were the biggest avoidable cost against the 10ms CPU budget.
+			let batch = '';
+			for (const line of lines) {
+				const trimmed = line.trim();
+				if (!trimmed || !trimmed.startsWith('data: ')) continue;
+				const data = trimmed.slice(6);
+				if (data === '[DONE]') {
+					// Terminate the whole read, not just this chunk's lines — some
+					// providers keep the socket open after [DONE], which previously
+					// held the response (and the connection) until their timeout.
+					sawDone = true;
+					break;
+				}
+
+				try {
+					const token = JSON.parse(data).choices?.[0]?.delta?.content;
+					if (token) batch += absorb(transformChunk ? transformChunk(token) : token);
+				} catch {
+					// Skip malformed SSE chunks and keep streaming.
+				}
+			}
+			return batch;
+		};
 
 		try {
-			while (true) {
+			while (!sawDone) {
 				const { done, value } = await reader.read();
 				if (done) break;
 
@@ -116,51 +182,17 @@ function streamLLMResponse(
 				const lines = buffer.split('\n');
 				buffer = lines.pop() || '';
 
-				for (const line of lines) {
-					const trimmed = line.trim();
-					if (!trimmed || !trimmed.startsWith('data: ')) continue;
-					const data = trimmed.slice(6);
-					if (data === '[DONE]') break;
+				const batch = drainLines(lines);
+				if (batch) await writer.write(encoder.encode(batch));
+			}
+			if (sawDone) reader.cancel().catch(() => {});
 
-					try {
-						const json = JSON.parse(data);
-						const token = json.choices?.[0]?.delta?.content;
-						if (token) {
-							let output = transformChunk ? transformChunk(token) : token;
-
-							// Scan for </head> to inject model metadata
-							if (!headInjected) {
-								headBuf += output;
-								const lower = headBuf.toLowerCase();
-								const idx = lower.indexOf('</head');
-								if (idx !== -1) {
-									output =
-										headBuf.slice(0, idx) + injectInHead + headBuf.slice(idx);
-									headBuf = '';
-									headInjected = true;
-								} else if (headBuf.length > HEAD_WINDOW) {
-									output = headBuf.slice(0, headBuf.length - HEAD_WINDOW);
-									headBuf = headBuf.slice(headBuf.length - HEAD_WINDOW);
-								} else {
-									continue;
-								}
-							}
-
-							if (injectBeforeClose) {
-								tail += output;
-								if (tail.length > TAIL_SIZE) {
-									const flush = tail.slice(0, tail.length - TAIL_SIZE);
-									tail = tail.slice(tail.length - TAIL_SIZE);
-									await writer.write(encoder.encode(flush));
-								}
-							} else {
-								await writer.write(encoder.encode(output));
-							}
-						}
-					} catch {
-						// Skip malformed SSE chunks and keep streaming.
-					}
-				}
+			// Flush the decoder and any final unterminated SSE line — without this
+			// a stream that ends without a trailing newline drops its last token.
+			buffer += decoder.decode();
+			if (!sawDone && buffer) {
+				const batch = drainLines([buffer]);
+				if (batch) await writer.write(encoder.encode(batch));
 			}
 		} catch (err) {
 			await writer.write(
@@ -212,14 +244,29 @@ function streamLLMResponse(
 // still thinking. Holding the response until the first byte keeps the browser in
 // its "waiting for document" state instead — the behaviour this had on Vercel.
 // Costs nothing: the pump is already running, we just delay the headers.
+//
+// OPENROUTER_TIMEOUT_MS only guards the headers phase of the upstream fetch, so
+// a model that returns 200 and then goes silent would otherwise hold this await
+// (and the request) forever. The watchdog turns both that hang and a zero-token
+// body into null, which the caller converts to the emergency page.
 async function untilFirstByte(readable) {
 	const reader = readable.getReader();
-	const first = await reader.read();
+	let watchdog;
+	const first = await Promise.race([
+		reader.read(),
+		new Promise((r) => {
+			watchdog = setTimeout(r, FIRST_BYTE_TIMEOUT_MS);
+		}),
+	]);
+	clearTimeout(watchdog);
+	if (!first || first.done) {
+		reader.cancel().catch(() => {});
+		return null;
+	}
 
 	return new ReadableStream({
 		start(controller) {
-			if (first.done) controller.close();
-			else controller.enqueue(first.value);
+			controller.enqueue(first.value);
 		},
 		async pull(controller) {
 			const { done, value } = await reader.read();
@@ -262,7 +309,38 @@ function docsHtmlSuffix(analytics) {
 }
 
 function escapeHtml(str) {
-	return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+	return str
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;');
+}
+
+// Strip anything the Response constructor would reject and cap the length, so
+// a crafted ?model= or a weird upstream error line can't crash header assembly
+// (which would also take out the emergency fallback path that reports it).
+function headerSafe(value) {
+	return String(value)
+		.replace(/[^\t\x20-\x7e]+/g, ' ')
+		.slice(0, 256);
+}
+
+// Shared headers for every HTML response. The CSP enforces at the browser what
+// SITE_PROMPT merely requests from the model: no scripts — except the beacon
+// when analytics is on. Inline styles stay open; they are the whole aesthetic.
+function htmlHeaders(model, failures, analytics) {
+	return {
+		'Content-Type': 'text/html; charset=utf-8',
+		'X-Content-Type-Options': 'nosniff',
+		'X-Powered-By': 'vibes',
+		'X-Model': headerSafe(model),
+		'Content-Security-Policy': analytics
+			? "default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src https://static.cloudflareinsights.com; connect-src https://cloudflareinsights.com"
+			: "default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+		...(failures.length
+			? { 'X-LLM-Failures': headerSafe(buildFailureSummary(failures)) }
+			: {}),
+	};
 }
 
 function buildOpenRouterBody(model, systemPrompt, userMessage, maxTokens) {
@@ -276,17 +354,6 @@ function buildOpenRouterBody(model, systemPrompt, userMessage, maxTokens) {
 		temperature: 0.7,
 		stream: true,
 	});
-}
-
-function shouldFallbackStatus(status) {
-	return (
-		status === 400 ||
-		status === 404 ||
-		status === 408 ||
-		status === 409 ||
-		status === 429 ||
-		status >= 500
-	);
 }
 
 function formatFailureReason(model, reason) {
@@ -364,9 +431,9 @@ function emergencyDocsText(failureSummary) {
 		`- a free chat model generates an entire HTML page on the fly\n` +
 		`- there are no static frontend files for normal routes\n\n` +
 		`What changed:\n` +
-		`- StepFun is no longer in the default free-model chain\n` +
-		`- the server now tries multiple free providers in sequence\n` +
-		`- timeout, rate limit, missing-model, and upstream 5xx failures now fall through to the next provider\n` +
+		`- the server runs a hedged race: the fastest free model goes first, and\n` +
+		`  another provider joins only if it stalls for a couple of seconds or fails\n` +
+		`- timeout, rate limit, missing-model, and upstream 5xx failures open the next lane immediately\n` +
 		`- if every free model fails, the server still returns a backup page instead of a raw error\n\n` +
 		`Power user knobs:\n` +
 		`- ?long=true asks for the more expensive free-model chain\n` +
@@ -403,18 +470,15 @@ async function fetchChatCompletion(
 	}
 }
 
-// Fire all models in parallel — first successful response wins.
-// When only one model is provided (custom model), runs it directly.
+// One model (custom ?model=): run it directly and surface its error.
+// Several models: hedged race — see the comment inside.
 async function callLLM(
 	apiKey,
 	models,
 	systemPrompt,
 	userMessage,
 	maxTokens = 4096,
-	options = {},
 ) {
-	const { allowFallback = models.length > 1 } = options;
-
 	if (models.length === 1) {
 		const res = await fetchChatCompletion(
 			apiKey,
@@ -431,54 +495,76 @@ async function callLLM(
 		throw error;
 	}
 
-	// Race all models concurrently — first ok response wins.
-	const racePromises = models.map(async (model) => {
-		try {
-			const res = await fetchChatCompletion(
-				apiKey,
-				model,
-				systemPrompt,
-				userMessage,
-				maxTokens,
-			);
-			if (res.ok) return { response: res, model };
+	// Hedged race. The old version fired every model at once and took the first
+	// winner — snappy, but OpenRouter :free models share a small per-account
+	// daily request cap and the losing requests still count, so every page view
+	// spent 4 requests to serve 1. Now lane 0 fires alone; each further lane
+	// opens after HEDGE_MS of silence, or immediately when the previous lane
+	// fails outright. A healthy fast model costs exactly one request.
+	// ponytail: worst case (every model hangs to timeout) now takes
+	// ~(n-1)*HEDGE_MS longer to reach the emergency page than full-parallel did.
+	return new Promise((resolve) => {
+		const failures = [];
+		let winnerChosen = false;
+		let launched = 0;
+		let inFlight = 0;
+		let staggerTimer = null;
 
-			const errText = (await res.text()).slice(0, 240);
-			throw new Error(`${res.status} ${errText}`.trim());
-		} catch (err) {
-			throw {
-				model,
-				reason: err.name === 'AbortError' ? 'timed out' : err.message,
-			};
-		}
+		const settle = (result) => {
+			if (staggerTimer) clearTimeout(staggerTimer);
+			staggerTimer = null;
+			resolve(result);
+		};
+
+		const launch = () => {
+			staggerTimer = null;
+			if (winnerChosen || launched >= models.length) return;
+			const model = models[launched++];
+			inFlight++;
+			if (launched < models.length) {
+				staggerTimer = setTimeout(launch, HEDGE_MS);
+			}
+
+			fetchChatCompletion(apiKey, model, systemPrompt, userMessage, maxTokens)
+				.then(async (res) => {
+					if (res.ok) {
+						if (winnerChosen) {
+							// A slower lane came back after the winner — drop its body so
+							// it stops holding one of the 6 outbound connections.
+							res.body?.cancel();
+							return;
+						}
+						winnerChosen = true;
+						// Keep the failures accumulated so far — the X-LLM-Failures
+						// header reports which lanes died on the way to the winner.
+						settle({ response: res, model, failures });
+						return;
+					}
+					const errText = (await res.text()).slice(0, 240);
+					throw new Error(`${res.status} ${errText}`.trim());
+				})
+				.catch((err) => {
+					failures.push(
+						formatFailureReason(
+							model,
+							err.name === 'AbortError' ? 'timed out' : err.message,
+						),
+					);
+					// This lane is dead — open the next one now instead of waiting
+					// out the stagger.
+					if (staggerTimer) clearTimeout(staggerTimer);
+					launch();
+				})
+				.finally(() => {
+					inFlight--;
+					if (!winnerChosen && inFlight === 0 && launched >= models.length) {
+						settle({ response: null, model: null, failures });
+					}
+				});
+		};
+
+		launch();
 	});
-
-	try {
-		const winner = await Promise.any(racePromises);
-		// Workers caps outbound connections at 6 — drop the losers instead of
-		// leaving their bodies unread for the life of the request.
-		for (const p of racePromises) {
-			p.then(
-				(r) => r.response !== winner.response && r.response.body?.cancel(),
-				() => {},
-			);
-		}
-		return { response: winner.response, model: winner.model, failures: [] };
-	} catch (aggErr) {
-		// All models failed — collect reasons.
-		const failures = (aggErr.errors || []).map((e) =>
-			formatFailureReason(
-				e.model || 'unknown',
-				e.reason || e.message || 'failed',
-			),
-		);
-		if (!allowFallback) {
-			const error = new Error('All LLM models failed');
-			error.failures = failures;
-			throw error;
-		}
-		return { response: null, model: null, failures };
-	}
 }
 
 export async function onRequest({ request, env, waitUntil }) {
@@ -493,6 +579,16 @@ export async function onRequest({ request, env, waitUntil }) {
 	// Previously this path fell through and served a hallucinated robots.txt as HTML.
 	if (path === '/robots.txt') {
 		return new Response('User-agent: *\nDisallow: /\nAllow: /$\n', {
+			headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+		});
+	}
+
+	// Vulnerability scanners probe paths like /wp-login.php and /.env all day,
+	// and each probe used to cost a full model generation. Obvious junk gets a
+	// cheap static 404 — the only 404 on a site where every other path exists.
+	if (SCANNER_PATHS.test(path)) {
+		return new Response('404: not even the AI wants to generate this page\n', {
+			status: 404,
 			headers: { 'Content-Type': 'text/plain; charset=utf-8' },
 		});
 	}
@@ -518,7 +614,6 @@ export async function onRequest({ request, env, waitUntil }) {
 				DOCS_PROMPT,
 				'Explain how this website works. Be meta. Be funny.',
 				2048,
-				{ allowFallback: !customModel },
 			);
 
 			if (!res) {
@@ -527,12 +622,8 @@ export async function onRequest({ request, env, waitUntil }) {
 					`${docsHtmlPrefix('emergency-docs-fallback')}${escapeHtml(emergencyDocsText(failureSummary))}${docsHtmlSuffix(analytics)}`,
 					{
 						headers: {
-							'Content-Type': 'text/html; charset=utf-8',
-							'X-Content-Type-Options': 'nosniff',
-							'X-Powered-By': 'vibes',
-							'X-Model': 'emergency-docs-fallback',
+							...htmlHeaders('emergency-docs-fallback', failures, analytics),
 							'X-LLM-Fallback': 'all-models-failed',
-							'X-LLM-Failures': failureSummary,
 						},
 					},
 				);
@@ -544,37 +635,31 @@ export async function onRequest({ request, env, waitUntil }) {
 
 			waitUntil(
 				(async () => {
-					await writer.write(
-						encoder.encode(docsHtmlPrefix(modelUsed || 'unknown')),
-					);
-
-					const innerStream = streamLLMResponse(res, escapeHtml);
-					const reader = innerStream.getReader();
+					// One try around every write: a client disconnect errors the
+					// writer, and any write after that must not escape into an
+					// unhandled rejection. On failure, cancel the inner reader so
+					// the upstream body is released rather than streamed into a
+					// dead pipe.
+					const reader = streamLLMResponse(res, escapeHtml).getReader();
 					try {
+						await writer.write(
+							encoder.encode(docsHtmlPrefix(modelUsed || 'unknown')),
+						);
 						while (true) {
 							const { done, value } = await reader.read();
 							if (done) break;
 							await writer.write(value);
 						}
+						await writer.write(encoder.encode(docsHtmlSuffix(analytics)));
+						await writer.close();
 					} catch {
-						// Stream already ended.
+						reader.cancel().catch(() => {});
 					}
-
-					await writer.write(encoder.encode(docsHtmlSuffix(analytics)));
-					await writer.close();
 				})(),
 			);
 
 			return new Response(readable, {
-				headers: {
-					'Content-Type': 'text/html; charset=utf-8',
-					'X-Content-Type-Options': 'nosniff',
-					'X-Powered-By': 'vibes',
-					'X-Model': modelUsed || 'unknown',
-					...(failures.length
-						? { 'X-LLM-Failures': buildFailureSummary(failures) }
-						: {}),
-				},
+				headers: htmlHeaders(modelUsed || 'unknown', failures, analytics),
 			});
 		}
 
@@ -600,19 +685,14 @@ export async function onRequest({ request, env, waitUntil }) {
 			SITE_PROMPT,
 			userMessage,
 			4096,
-			{ allowFallback: !customModel },
 		);
 
 		if (!res) {
 			const failureSummary = buildFailureSummary(failures);
 			return new Response(emergencyPageHtml(path, failureSummary, analytics), {
 				headers: {
-					'Content-Type': 'text/html; charset=utf-8',
-					'X-Content-Type-Options': 'nosniff',
-					'X-Powered-By': 'vibes',
-					'X-Model': 'emergency-static-fallback',
+					...htmlHeaders('emergency-static-fallback', failures, analytics),
 					'X-LLM-Fallback': 'all-models-failed',
-					'X-LLM-Failures': failureSummary,
 				},
 			});
 		}
@@ -621,16 +701,28 @@ export async function onRequest({ request, env, waitUntil }) {
 		const readable = await untilFirstByte(
 			streamLLMResponse(res, null, analytics, modelMeta, waitUntil),
 		);
+
+		// The winner returned 200 but produced no output before the watchdog
+		// fired (or its body closed with zero tokens, e.g. a JSON error in an
+		// SSE costume). A blank 200 is the one thing this site must never serve.
+		if (!readable) {
+			return new Response(
+				emergencyPageHtml(
+					path,
+					formatFailureReason(modelUsed, 'no output before timeout'),
+					analytics,
+				),
+				{
+					headers: {
+						...htmlHeaders('emergency-static-fallback', [], analytics),
+						'X-LLM-Fallback': 'first-byte-timeout',
+					},
+				},
+			);
+		}
+
 		return new Response(readable, {
-			headers: {
-				'Content-Type': 'text/html; charset=utf-8',
-				'X-Content-Type-Options': 'nosniff',
-				'X-Powered-By': 'vibes',
-				'X-Model': modelUsed || 'unknown',
-				...(failures.length
-					? { 'X-LLM-Failures': buildFailureSummary(failures) }
-					: {}),
-			},
+			headers: htmlHeaders(modelUsed || 'unknown', failures, analytics),
 		});
 	} catch (err) {
 		const failureSummary = buildFailureSummary(err.failures || []);
@@ -641,7 +733,7 @@ export async function onRequest({ request, env, waitUntil }) {
 			headers:
 				failureSummary === 'unknown failure'
 					? {}
-					: { 'X-LLM-Failures': failureSummary },
+					: { 'X-LLM-Failures': headerSafe(failureSummary) },
 		});
 	}
 }

@@ -79,10 +79,18 @@ that claims to ship no JavaScript.
 ## Keeping the bill at zero
 
 Every crawler hit is a full LLM generation, which is how the previous host's
-usage limits got eaten. Two guards:
+usage limits got eaten. The code-side guards:
 
 - `/robots.txt` is served directly by the function and disallows everything but `/`.
-- Turn on **Bot Fight Mode** in the Cloudflare dashboard under **Security → Bots**.
+- Obvious vuln-scanner probes (`/wp-login.php`, `/.env`, `*.php`, ...) get a static 404.
+- The model race is hedged, so a normal page view costs one OpenRouter request, not four.
+
+And two dashboard toggles the code can't do for you:
+
+- **Bot Fight Mode** under **Security → Bots**.
+- A **rate limiting rule** under **Security → WAF → Rate limiting rules** (the
+  free plan includes one) — there is no in-code rate limit, so one curl loop
+  can otherwise drain the OpenRouter daily quota on the server's key.
 
 Cloudflare's free tier gives 100k requests/day and unmetered bandwidth. The one
 limit worth watching is **10ms CPU per request** — time spent waiting on
@@ -93,7 +101,7 @@ seeing `Error 1102`, the $5/mo Workers Paid plan raises it to 30s.
 
 | Param                        | Effect                                                                                       |
 | ---------------------------- | -------------------------------------------------------------------------------------------- |
-| `?long=true`                 | Uses a larger, slower model (NVIDIA Nemotron 3 Super 120B)                                   |
+| `?long=true`                 | Starts the model chain with a larger, slower model (NVIDIA Nemotron 3 Super 120B)            |
 | `?model=provider/model-name` | Override the model — use any model ID from [OpenRouter models](https://openrouter.ai/models) |
 | `?key=sk-or-v1-xxx`          | Override the API key (useful for testing with your own key)                                  |
 
@@ -104,6 +112,8 @@ seeing `Error 1102`, the $5/mo Workers Paid plan raises it to 30s.
 ├── functions/
 │   └── [[path]].js       # The one and only function. Catch-all — the filename IS the router.
 ├── public/               # Deliberately empty. Pages needs a build output dir.
+├── test.mjs              # Dependency-free smoke tests (npm test)
+├── .github/              # PR roast bot (reviews every PR as a 1999 webmaster)
 ├── package.json
 ├── .dev.vars.example     # Template for local environment variables
 ├── README.md             # The unhinged one
@@ -113,16 +123,23 @@ seeing `Error 1102`, the $5/mo Workers Paid plan raises it to 30s.
 There is no `vercel.json` equivalent. `[[path]]` is Cloudflare's catch-all
 convention, so every route lands in that one file with no config.
 
-## Free Models (Fallback Chain)
+## Free Models (Hedged Race)
 
-The site tries these models in order. If one times out, disappears, rate-limits, or has an upstream meltdown, it falls through to the next:
+The first model in the chain gets a ~2 second head start. If it hasn't answered
+by then — or fails outright — the next lane opens while the first keeps running,
+and the first model to respond wins. A healthy fast model costs exactly one
+OpenRouter request per page view; the free tier's shared daily request cap is
+why losing lanes aren't fired preemptively.
 
 **Fast (default):**
 
-1. `z-ai/glm-4.5-air:free`
-2. `nvidia/nemotron-3-nano-30b-a3b:free`
+1. `nvidia/nemotron-3-nano-30b-a3b:free`
+2. `openai/gpt-oss-120b:free`
 3. `minimax/minimax-m2.5:free`
-4. `openai/gpt-oss-120b:free`
+4. `z-ai/glm-4.5-air:free`
+
+Order matters now: lane 1 is the model you actually expect to serve most
+traffic, the rest are insurance.
 
 **Full (`?long=true`):**
 
