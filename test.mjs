@@ -235,6 +235,11 @@ await check('?key= is used for auth and stripped from the prompt; ?long= picks F
 	await (await onRequest(c)).text();
 	await Promise.all(c.pending);
 	assert.strictEqual(calls[0].auth, 'Bearer sk-or-v1-visitor');
+	assert.deepStrictEqual(
+		calls[0].body.reasoning,
+		{ effort: 'none', exclude: true },
+		'reasoning must be disabled and excluded — reasoning floods caused the zombie/CPU incidents',
+	);
 	const userMsg = calls[0].body.messages[1].content;
 	assert.ok(!userMsg.includes('sk-or-v1'), 'key leaked into the prompt');
 	assert.ok(!userMsg.includes('long=true'), 'long= leaked into the prompt');
@@ -260,6 +265,12 @@ await check('malformed SSE lines are skipped, valid ones still stream', async ()
 				start(controller) {
 					controller.enqueue(encoder.encode('data: {not json}\n'));
 					controller.enqueue(encoder.encode(': keep-alive comment\n'));
+					// A reasoning delta must count as neither output nor proof.
+					controller.enqueue(
+						encoder.encode(
+							`data: ${JSON.stringify({ choices: [{ delta: { reasoning: 'SHOULD-NOT-APPEAR' } }] })}\n`,
+						),
+					);
 					const payload = { choices: [{ delta: { content: '<html><head></head><body>survived</body></html>' } }] };
 					controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n`));
 					controller.enqueue(encoder.encode('data: [DONE]\n'));
@@ -271,6 +282,7 @@ await check('malformed SSE lines are skipped, valid ones still stream', async ()
 	const html = await (await onRequest(c)).text();
 	await Promise.all(c.pending);
 	assert.match(html, /<body>survived<\/body>/);
+	assert.ok(!html.includes('SHOULD-NOT-APPEAR'), 'reasoning delta leaked into the page');
 });
 
 await check('[DONE] ends the response even if the provider never closes the socket', async () => {

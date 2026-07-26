@@ -418,6 +418,13 @@ function buildOpenRouterBody(model, systemPrompt, userMessage, maxTokens) {
 		max_tokens: maxTokens,
 		temperature: 0.7,
 		stream: true,
+		// These free models are reasoning models. Left alone they stream a long
+		// chain-of-thought as delta.reasoning before any delta.content: the page
+		// looks "zombie" while the model monologues, and parsing that flood of
+		// SSE lines burns real CPU against the 10ms budget. Reasoning adds
+		// nothing to a site whose brand is unmedicated output — turn it off
+		// where supported, and keep it out of the stream everywhere.
+		reasoning: { effort: 'none', exclude: true },
 	});
 }
 
