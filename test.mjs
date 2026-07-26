@@ -313,11 +313,11 @@ await check('final token without trailing newline is not dropped', async () => {
 	assert.match(html, /<body>tail<\/body>/);
 });
 
-await check('zero-token 200: strikes the zombie, retries, then emergency page', async () => {
+await check('all models tokenless: every lane gets one shot, then emergency page', async () => {
 	let fetches = 0;
 	globalThis.fetch = async () => {
 		fetches++;
-		return new Response(sseStream([]), { status: 200 }); // 200, no tokens, ever
+		return new Response(sseStream([]), { status: 200 }); // 200, closes with no tokens
 	};
 	const c = ctx('https://x.dev/empty-win', KEY);
 	const res = await onRequest(c);
@@ -327,26 +327,53 @@ await check('zero-token 200: strikes the zombie, retries, then emergency page', 
 	assert.strictEqual(fetches, 4, 'every model should get one shot at a zombie-only outage');
 });
 
-await check('zombie winner falls through to the next model, not the emergency page', async () => {
-	// Model 1 returns 200 then never emits a byte; model 2 serves a real page.
-	// FIRST_BYTE_TIMEOUT_MS is env-tunable so this test fails in ms, not 15s.
+await check('a zombie lane cannot win the race — first proven token takes it', async () => {
+	// Lane 1 opens an SSE socket, sends only keep-alives, never a token — the
+	// exact production failure. Lane 2 serves a real page. The winner must be
+	// lane 2, decided by proven token rather than headers, in ~hedgeMs.
 	let call = 0;
 	const encoder = new TextEncoder();
 	globalThis.fetch = async () => {
 		call++;
 		if (call === 1) {
-			return new Response(new ReadableStream({ start() {} }), { status: 200 });
+			return new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.enqueue(encoder.encode(': OPENROUTER PROCESSING\n'));
+						// ...and then silence, forever.
+					},
+				}),
+				{ status: 200 },
+			);
 		}
 		return new Response(sseStream(PAGE), { status: 200 });
 	};
-	const c = ctx('https://x.dev/zombie', { ...KEY, FIRST_BYTE_TIMEOUT_MS: '100' });
+	const t0 = Date.now();
+	const c = ctx('https://x.dev/zombie', {
+		...KEY,
+		FIRST_BYTE_TIMEOUT_MS: '400',
+		HEDGE_MS: '50',
+	});
 	const res = await onRequest(c);
 	const html = await res.text();
 	await Promise.all(c.pending).catch(() => {});
 	assert.strictEqual(res.headers.get('X-LLM-Fallback'), null, 'should not be a fallback page');
 	assert.match(html, /<body>ok<\/body>/);
-	assert.match(res.headers.get('X-LLM-Failures'), /no output before timeout/);
 	assert.strictEqual(call, 2);
+	assert.ok(
+		Date.now() - t0 < 350,
+		'winner should be decided by the hedge, not by waiting out the zombie clock',
+	);
+});
+
+await check('custom ?model= zombie surfaces 504, does not hang', async () => {
+	globalThis.fetch = async () =>
+		new Response(sseStream([]), { status: 200 }); // tokenless close
+	const res = await onRequest(
+		ctx('https://x.dev/x?model=zombie/model', { ...KEY, FIRST_BYTE_TIMEOUT_MS: '200' }),
+	);
+	assert.strictEqual(res.status, 504);
+	assert.match(await res.text(), /never produced a token/);
 });
 
 await check('scanner probes get a cheap 404 and never touch the model', async () => {

@@ -125,11 +125,18 @@ convention, so every route lands in that one file with no config.
 
 ## Free Models (Hedged Race)
 
-The first model in the chain gets a ~2 second head start. If it hasn't answered
-by then — or fails outright — the next lane opens while the first keeps running,
-and the first model to respond wins. A healthy fast model costs exactly one
-OpenRouter request per page view; the free tier's shared daily request cap is
-why losing lanes aren't fired preemptively.
+The first model in the chain gets a ~2 second head start. If it hasn't produced
+a token by then — or fails outright — the next lane opens while the first keeps
+running. **The first model to produce an actual token wins**, not the first to
+return HTTP 200: overloaded free models routinely open the stream and then never
+say anything ("zombies"), and headers-based racing let them win. A healthy fast
+model costs exactly one OpenRouter request per page view; the free tier's shared
+daily request cap is why losing lanes aren't fired preemptively.
+
+Tunables (set as env vars in the dashboard, no redeploy needed):
+`FIRST_BYTE_TIMEOUT_MS` (default 15000) — how long a lane may stay silent
+before it's disqualified; `HEDGE_MS` (default 2000) — the head start each lane
+gets before the next one opens.
 
 **Fast (default):**
 

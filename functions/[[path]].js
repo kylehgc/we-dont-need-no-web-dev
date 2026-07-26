@@ -263,44 +263,85 @@ function streamLLMResponse(
 	return readable;
 }
 
-// Cloudflare flushes response headers as soon as you return a streaming body, so
-// the browser commits the navigation and paints a blank page while the model is
-// still thinking. Holding the response until the first byte keeps the browser in
-// its "waiting for document" state instead — the behaviour this had on Vercel.
-// Costs nothing: the pump is already running, we just delay the headers.
+// A 200 from OpenRouter proves nothing: overloaded free models open the SSE
+// socket, send keep-alive comments, and never produce a token ("zombies" —
+// observed in production within minutes of the first deploy). This reads the
+// body until an actual delta token appears, then returns a response whose body
+// replays the buffered bytes ahead of the live tail, so nothing is lost.
+// Returns null on timeout or a tokenless close.
 //
-// OPENROUTER_TIMEOUT_MS only guards the headers phase of the upstream fetch, so
-// a model that returns 200 and then goes silent would otherwise hold this await
-// (and the request) forever. The watchdog turns both that hang and a zero-token
-// body into null, which the caller converts to the emergency page.
-async function untilFirstByte(readable, timeoutMs = FIRST_BYTE_TIMEOUT_MS) {
-	const reader = readable.getReader();
+// This is also what keeps the browser in its "waiting for document" state
+// instead of painting a blank committed page: the Response isn't constructed —
+// so headers can't flush — until real content provably exists.
+async function proveFirstToken(res, timeoutMs) {
+	const reader = res.body.getReader();
+	const chunks = [];
+	const decoder = new TextDecoder();
+	let text = '';
 	let watchdog;
-	const first = await Promise.race([
-		reader.read(),
-		new Promise((r) => {
-			watchdog = setTimeout(r, timeoutMs);
-		}),
-	]);
-	clearTimeout(watchdog);
-	if (!first || first.done) {
-		reader.cancel().catch(() => {});
-		return null;
-	}
-
-	return new ReadableStream({
-		start(controller) {
-			controller.enqueue(first.value);
-		},
-		async pull(controller) {
-			const { done, value } = await reader.read();
-			if (done) controller.close();
-			else controller.enqueue(value);
-		},
-		cancel(reason) {
-			return reader.cancel(reason);
-		},
+	const deadline = new Promise((r) => {
+		watchdog = setTimeout(r, timeoutMs);
 	});
+
+	// Same parse the pump uses: a "data:" line whose delta has non-empty
+	// content. Keep-alive comment lines (": ...") never match.
+	const hasToken = (lines) => {
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (!trimmed.startsWith('data: ') || trimmed === 'data: [DONE]')
+				continue;
+			try {
+				if (JSON.parse(trimmed.slice(6)).choices?.[0]?.delta?.content)
+					return true;
+			} catch {
+				// Malformed line — keep scanning.
+			}
+		}
+		return false;
+	};
+
+	// Replays the buffered proof bytes, then hands over to the live tail.
+	const provenBody = () => ({
+		body: new ReadableStream({
+			start(controller) {
+				for (const c of chunks) controller.enqueue(c);
+			},
+			async pull(controller) {
+				const { done, value } = await reader.read();
+				if (done) controller.close();
+				else controller.enqueue(value);
+			},
+			cancel(reason) {
+				return reader.cancel(reason);
+			},
+		}),
+	});
+
+	try {
+		while (true) {
+			const next = await Promise.race([
+				reader.read().then((r) => ({ r })),
+				deadline,
+			]);
+			if (!next) {
+				reader.cancel().catch(() => {});
+				return null;
+			}
+			if (next.r.done) {
+				// Stream ended mid-proof. Flush the decoder and scan the final
+				// unterminated line too — a body whose only token has no trailing
+				// newline is still a proven body.
+				text += decoder.decode();
+				return hasToken(text.split('\n')) ? provenBody() : null;
+			}
+
+			chunks.push(next.r.value);
+			text += decoder.decode(next.r.value, { stream: true });
+			if (hasToken(text.split('\n').slice(0, -1))) return provenBody();
+		}
+	} finally {
+		clearTimeout(watchdog);
+	}
 }
 
 // The padding comment pushes the initial chunk past mobile browser buffering thresholds (~1KB).
@@ -495,14 +536,18 @@ async function fetchChatCompletion(
 }
 
 // One model (custom ?model=): run it directly and surface its error.
-// Several models: hedged race — see the comment inside.
+// Several models: hedged race to the first PROVEN TOKEN — see inside.
 async function callLLM(
 	apiKey,
 	models,
 	systemPrompt,
 	userMessage,
 	maxTokens = 4096,
+	timings = {},
 ) {
+	const firstByteMs = timings.firstByteMs || FIRST_BYTE_TIMEOUT_MS;
+	const hedgeMs = timings.hedgeMs || HEDGE_MS;
+
 	if (models.length === 1) {
 		const res = await fetchChatCompletion(
 			apiKey,
@@ -511,22 +556,39 @@ async function callLLM(
 			userMessage,
 			maxTokens,
 		);
-		if (res.ok) return { response: res, model: models[0], failures: [] };
-		const errText = (await res.text()).slice(0, 240);
-		const error = new Error(`LLM API error: ${res.status} — ${errText}`);
-		error.status = res.status;
-		error.failures = [formatFailureReason(models[0], `${res.status}`)];
-		throw error;
+		if (!res.ok) {
+			const errText = (await res.text()).slice(0, 240);
+			const error = new Error(`LLM API error: ${res.status} — ${errText}`);
+			error.status = res.status;
+			error.failures = [formatFailureReason(models[0], `${res.status}`)];
+			throw error;
+		}
+		const proven = await proveFirstToken(res, firstByteMs);
+		if (!proven) {
+			const error = new Error(
+				`LLM API error: ${models[0]} opened a stream but never produced a token`,
+			);
+			error.status = 504;
+			error.failures = [
+				formatFailureReason(models[0], 'no output before timeout'),
+			];
+			throw error;
+		}
+		return { response: proven, model: models[0], failures: [] };
 	}
 
-	// Hedged race. The old version fired every model at once and took the first
-	// winner — snappy, but OpenRouter :free models share a small per-account
-	// daily request cap and the losing requests still count, so every page view
-	// spent 4 requests to serve 1. Now lane 0 fires alone; each further lane
-	// opens after HEDGE_MS of silence, or immediately when the previous lane
-	// fails outright. A healthy fast model costs exactly one request.
-	// ponytail: worst case (every model hangs to timeout) now takes
-	// ~(n-1)*HEDGE_MS longer to reach the emergency page than full-parallel did.
+	// Hedged race to the first proven token. Two hard lessons baked in:
+	//
+	// 1. (Vercel era) Firing every model at once burned the shared OpenRouter
+	//    :free daily cap 4x — losing requests count. So lane 0 fires alone and
+	//    each further lane opens after hedgeMs, or immediately when a lane
+	//    fails. A healthy fast model still costs exactly one request.
+	// 2. (Day one on Cloudflare) Declaring the winner on 200 headers let a
+	//    zombie win: overloaded free models open the SSE socket and never emit
+	//    a token, and the same model zombies consistently once overloaded. So
+	//    a lane only wins by producing an actual delta token; a zombie lane
+	//    burns its own proof clock without blocking anyone — later lanes race
+	//    it concurrently and the first real token takes the pot.
 	return new Promise((resolve) => {
 		const failures = [];
 		let winnerChosen = false;
@@ -546,26 +608,27 @@ async function callLLM(
 			const model = models[launched++];
 			inFlight++;
 			if (launched < models.length) {
-				staggerTimer = setTimeout(launch, HEDGE_MS);
+				staggerTimer = setTimeout(launch, hedgeMs);
 			}
 
 			fetchChatCompletion(apiKey, model, systemPrompt, userMessage, maxTokens)
 				.then(async (res) => {
-					if (res.ok) {
-						if (winnerChosen) {
-							// A slower lane came back after the winner — drop its body so
-							// it stops holding one of the 6 outbound connections.
-							res.body?.cancel();
-							return;
-						}
-						winnerChosen = true;
-						// Keep the failures accumulated so far — the X-LLM-Failures
-						// header reports which lanes died on the way to the winner.
-						settle({ response: res, model, failures });
+					if (!res.ok) {
+						const errText = (await res.text()).slice(0, 240);
+						throw new Error(`${res.status} ${errText}`.trim());
+					}
+					const proven = await proveFirstToken(res, firstByteMs);
+					if (!proven) throw new Error('no output before timeout');
+					if (winnerChosen) {
+						// Proved too late — drop the body so it stops holding one of
+						// the 6 outbound connections.
+						proven.body.cancel().catch(() => {});
 						return;
 					}
-					const errText = (await res.text()).slice(0, 240);
-					throw new Error(`${res.status} ${errText}`.trim());
+					winnerChosen = true;
+					// Keep the failures accumulated so far — the X-LLM-Failures
+					// header reports which lanes died on the way to the winner.
+					settle({ response: proven, model, failures });
 				})
 				.catch((err) => {
 					failures.push(
@@ -620,6 +683,7 @@ export async function onRequest({ request, env, waitUntil }) {
 	const analytics = analyticsScript(env.CF_BEACON_TOKEN);
 	// Dashboard-tunable without a redeploy (and injectable from the tests).
 	const firstByteMs = Number(env.FIRST_BYTE_TIMEOUT_MS) || FIRST_BYTE_TIMEOUT_MS;
+	const hedgeMs = Number(env.HEDGE_MS) || HEDGE_MS;
 	const apiKey = url.searchParams.get('key') || env.OPENROUTER_API_KEY;
 	if (!apiKey) {
 		return new Response(
@@ -640,6 +704,7 @@ export async function onRequest({ request, env, waitUntil }) {
 				DOCS_PROMPT,
 				'Explain how this website works. Be meta. Be funny.',
 				2048,
+				{ firstByteMs, hedgeMs },
 			);
 
 			if (!res) {
@@ -705,41 +770,16 @@ export async function onRequest({ request, env, waitUntil }) {
 			cleanSearch ? ` with query string: "?${cleanSearch}"` : ''
 		}. Generate a full HTML page for this path.`;
 
-		// A race winner can still be a zombie: 200 headers, then no output before
-		// the first-byte watchdog fires (or a body that closes with zero tokens —
-		// a JSON error in an SSE costume). Seen in production on day one. When
-		// that happens, strike the zombie from the list and re-run the race with
-		// whatever models remain, rather than going straight to the emergency
-		// page while healthy models sit unused.
-		let remaining = models;
-		const failures = [];
-		let modelUsed = null;
-		let readable = null;
+		const { response: res, model: modelUsed, failures } = await callLLM(
+			apiKey,
+			models,
+			SITE_PROMPT,
+			userMessage,
+			4096,
+			{ firstByteMs, hedgeMs },
+		);
 
-		while (!readable && remaining.length) {
-			const attempt = await callLLM(
-				apiKey,
-				remaining,
-				SITE_PROMPT,
-				userMessage,
-				4096,
-			);
-			failures.push(...attempt.failures);
-			if (!attempt.response) break;
-
-			modelUsed = attempt.model;
-			const modelMeta = `<meta name="x-model" content="${escapeHtml(modelUsed)}">`;
-			readable = await untilFirstByte(
-				streamLLMResponse(attempt.response, null, analytics, modelMeta, waitUntil),
-				firstByteMs,
-			);
-			if (!readable) {
-				failures.push(formatFailureReason(modelUsed, 'no output before timeout'));
-				remaining = remaining.filter((m) => m !== modelUsed);
-			}
-		}
-
-		if (!readable) {
+		if (!res) {
 			return new Response(
 				emergencyPageHtml(path, buildFailureSummary(failures), analytics),
 				{
@@ -751,6 +791,10 @@ export async function onRequest({ request, env, waitUntil }) {
 			);
 		}
 
+		// The winner arrives pre-proven: its body already contains a real token,
+		// so returning here cannot flush headers for a page with no content.
+		const modelMeta = `<meta name="x-model" content="${escapeHtml(modelUsed)}">`;
+		const readable = streamLLMResponse(res, null, analytics, modelMeta, waitUntil);
 		return new Response(readable, {
 			headers: htmlHeaders(modelUsed, failures, analytics),
 		});
