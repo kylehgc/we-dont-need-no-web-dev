@@ -248,6 +248,54 @@ await check('?key= authenticates and is stripped from the prompt; ?long= raises 
 	assert.match(userMsg, /vibe=maximal/);
 });
 
+await check('classifier model output is rejected, next lane serves the page', async () => {
+	// The exact production failure: openrouter/free rolled a content-safety
+	// classifier, which answered a request for a webpage with a verdict.
+	let call = 0;
+	globalThis.fetch = async () => {
+		call++;
+		if (call === 1) return new Response(sseStream(['User Safety: safe']), { status: 200 });
+		return new Response(sseStream(PAGE), { status: 200 });
+	};
+	const c = ctx('https://x.dev/not-a-classifier', { ...KEY, HEDGE_MS: '50' });
+	const res = await onRequest(c);
+	const html = await res.text();
+	await Promise.all(c.pending).catch(() => {});
+	assert.ok(!html.includes('User Safety'), 'classifier verdict reached the browser');
+	assert.match(html, /<body>ok<\/body>/);
+	assert.match(res.headers.get('X-LLM-Failures') || '', /no usable output/i);
+});
+
+await check('prose-only model is rejected for the site route', async () => {
+	let call = 0;
+	globalThis.fetch = async () => {
+		call++;
+		if (call === 1) {
+			return new Response(
+				sseStream([
+					"I'm sorry, but I can't help with generating that webpage. ",
+					'Let me explain why this request is problematic in some detail. ',
+				]),
+				{ status: 200 },
+			);
+		}
+		return new Response(sseStream(PAGE), { status: 200 });
+	};
+	const c = ctx('https://x.dev/refusal', { ...KEY, HEDGE_MS: '50' });
+	const html = await (await onRequest(c)).text();
+	await Promise.all(c.pending).catch(() => {});
+	assert.ok(!html.includes("I'm sorry"), 'refusal text reached the browser');
+	assert.match(html, /<body>ok<\/body>/);
+});
+
+await check('docs route still accepts plain prose', async () => {
+	stubFetch(['just some plain text, no angle brackets at all, which is correct here']);
+	const c = ctx('https://x.dev/docs/', KEY);
+	const html = await (await onRequest(c)).text();
+	await Promise.all(c.pending);
+	assert.match(html, /just some plain text/);
+});
+
 await check('truncated page gets its tags closed', async () => {
 	// Model runs out of budget mid-document: no </html> ever arrives.
 	stubFetch(['<!DOCTYPE html><html><head></head><body><div>cut off mid-']);
@@ -379,9 +427,9 @@ await check('all models tokenless: every lane gets one shot, then emergency page
 	const c = ctx('https://x.dev/empty-win', KEY);
 	const res = await onRequest(c);
 	assert.strictEqual(res.headers.get('X-LLM-Fallback'), 'all-models-failed');
-	assert.match(res.headers.get('X-LLM-Failures'), /no output before timeout/);
+	assert.match(res.headers.get('X-LLM-Failures'), /no usable output before timeout/);
 	assert.match(await res.text(), /LLM OUTAGE/);
-	assert.strictEqual(fetches, 3, 'every lane should get one shot at a zombie-only outage');
+	assert.strictEqual(fetches, 4, 'every lane should get one shot at a zombie-only outage');
 });
 
 await check('a zombie lane cannot win the race — first proven token takes it', async () => {

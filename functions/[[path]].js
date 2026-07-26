@@ -26,7 +26,32 @@ const SCANNER_PATHS =
 // maintain, and because each call re-rolls, the hedge lanes below naturally
 // land on different models — retry diversity for free.
 const FREE_ROUTER = 'openrouter/free';
-const LANES = [FREE_ROUTER, FREE_ROUTER, FREE_ROUTER];
+const LANES = [FREE_ROUTER, FREE_ROUTER, FREE_ROUTER, FREE_ROUTER];
+
+// The free pool is not all general-purpose chat models: it also holds safety
+// classifiers, vision encoders and code-completion models. A random roll can
+// land on one, and it will answer a request for a 1999 webpage with something
+// like "User Safety: safe" (observed in production). So a lane must prove it
+// is producing the *right kind* of output, not merely any output.
+//
+// Returns true (usable), false (wrong kind — disqualify now), or undefined
+// (too early to tell — keep reading).
+const PROOF_WINDOW = 80;
+
+function looksLikeHtml(content, streamEnded) {
+	if (/<\s*(!doctype|html|head|body|div|center|table|font|marquee|style|h[1-6]|p\b|span|a\b)/i.test(content))
+		return true;
+	// Models often lead with a stray newline or a ```html fence; only judge
+	// once there is enough non-markup prose to be confident it is not HTML.
+	if (streamEnded || content.replace(/^[\s`]*(html)?/i, '').length > PROOF_WINDOW)
+		return false;
+	return undefined;
+}
+
+function looksLikeProse(content, streamEnded) {
+	if (content.trim().length > 0) return true;
+	return streamEnded ? false : undefined;
+}
 
 // Reasoning models bill their hidden thinking against max_tokens, so a page can
 // run out of budget mid-<div> and arrive truncated. Headroom is cheap.
@@ -293,12 +318,13 @@ function streamLLMResponse(
 // This is also what keeps the browser in its "waiting for document" state
 // instead of painting a blank committed page: the Response isn't constructed —
 // so headers can't flush — until real content provably exists.
-async function proveFirstToken(res, timeoutMs) {
+async function proveFirstToken(res, timeoutMs, looksUsable = () => true) {
 	if (!res.body) return null;
 	const reader = res.body.getReader();
 	const chunks = [];
 	const decoder = new TextDecoder();
 	let text = '';
+	let content = '';
 	let watchdog;
 	const deadline = new Promise((r) => {
 		watchdog = setTimeout(r, timeoutMs);
@@ -316,12 +342,13 @@ async function proveFirstToken(res, timeoutMs) {
 			try {
 				const json = JSON.parse(trimmed.slice(6));
 				if (json.model) servedBy = json.model;
-				if (json.choices?.[0]?.delta?.content) return true;
+				const token = json.choices?.[0]?.delta?.content;
+				if (token) content += token;
 			} catch {
 				// Malformed line — keep scanning.
 			}
 		}
-		return false;
+		return content;
 	};
 
 	// Replays the buffered proof bytes, then hands over to the live tail.
@@ -357,12 +384,25 @@ async function proveFirstToken(res, timeoutMs) {
 				// unterminated line too — a body whose only token has no trailing
 				// newline is still a proven body.
 				text += decoder.decode();
-				return hasToken(text.split('\n')) ? provenBody() : null;
+				const final = hasToken(text.split('\n'));
+				return final && looksUsable(final, true) ? provenBody() : null;
 			}
 
 			chunks.push(next.r.value);
 			text += decoder.decode(next.r.value, { stream: true });
-			if (hasToken(text.split('\n').slice(0, -1))) return provenBody();
+			const soFar = hasToken(text.split('\n').slice(0, -1));
+			if (soFar) {
+				const verdict = looksUsable(soFar, false);
+				if (verdict === true) return provenBody();
+				// Definitively wrong kind of output (a classifier verdict, a
+				// refusal, prose where HTML was asked for). Disqualify the lane
+				// now so the hedge can roll a different model.
+				if (verdict === false) {
+					reader.cancel().catch(() => {});
+					return null;
+				}
+				// undefined: not enough output yet to judge — keep reading.
+			}
 		}
 	} finally {
 		clearTimeout(watchdog);
@@ -581,6 +621,7 @@ async function callLLM(
 ) {
 	const firstByteMs = timings.firstByteMs || FIRST_BYTE_TIMEOUT_MS;
 	const hedgeMs = timings.hedgeMs || HEDGE_MS;
+	const looksUsable = timings.looksUsable || (() => true);
 
 	if (models.length === 1) {
 		const res = await fetchChatCompletion(
@@ -597,14 +638,14 @@ async function callLLM(
 			error.failures = [formatFailureReason(models[0], `${res.status}`)];
 			throw error;
 		}
-		const proven = await proveFirstToken(res, firstByteMs);
+		const proven = await proveFirstToken(res, firstByteMs, looksUsable);
 		if (!proven) {
 			const error = new Error(
 				`LLM API error: ${models[0]} opened a stream but never produced a token`,
 			);
 			error.status = 504;
 			error.failures = [
-				formatFailureReason(models[0], 'no output before timeout'),
+				formatFailureReason(models[0], 'no usable output before timeout'),
 			];
 			throw error;
 		}
@@ -651,8 +692,8 @@ async function callLLM(
 						const errText = (await res.text()).slice(0, 240);
 						throw new Error(`${res.status} ${errText}`.trim());
 					}
-					const proven = await proveFirstToken(res, firstByteMs);
-					if (!proven) throw new Error('no output before timeout');
+					const proven = await proveFirstToken(res, firstByteMs, looksUsable);
+					if (!proven) throw new Error('no usable output before timeout');
 					if (winnerChosen) {
 						// Proved too late — drop the body so it stops holding one of
 						// the 6 outbound connections.
@@ -738,7 +779,7 @@ export async function onRequest({ request, env, waitUntil }) {
 				DOCS_PROMPT,
 				'Explain how this website works. Be meta. Be funny.',
 				4096,
-				{ firstByteMs, hedgeMs },
+				{ firstByteMs, hedgeMs, looksUsable: looksLikeProse },
 			);
 
 			if (!res) {
@@ -806,7 +847,7 @@ export async function onRequest({ request, env, waitUntil }) {
 			SITE_PROMPT,
 			userMessage,
 			useLong ? MAX_TOKENS_LONG : MAX_TOKENS,
-			{ firstByteMs, hedgeMs },
+			{ firstByteMs, hedgeMs, looksUsable: looksLikeHtml },
 		);
 
 		if (!res) {
