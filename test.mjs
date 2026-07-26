@@ -128,6 +128,48 @@ await check('docs page streams inside its shell', async () => {
 	assert.match(html, /<span class="cursor"><\/span><\/pre>/);
 });
 
+await check('response is held until the first token arrives', async () => {
+	// Stream that emits nothing until we say so, mimicking a model that takes
+	// seconds to produce its first token.
+	let release;
+	const gate = new Promise((r) => {
+		release = r;
+	});
+	const encoder = new TextEncoder();
+	globalThis.fetch = async () =>
+		new Response(
+			new ReadableStream({
+				async start(controller) {
+					await gate;
+					const payload = { choices: [{ delta: { content: '<html><head></head><body>late</body></html>' } }] };
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n`));
+					controller.enqueue(encoder.encode('data: [DONE]\n'));
+					controller.close();
+				},
+			}),
+		);
+
+	const c = ctx('https://x.dev/slow', KEY);
+	let resolved = false;
+	const pending = onRequest(c).then((r) => {
+		resolved = true;
+		return r;
+	});
+
+	// Give it a generous window to resolve early if the guard is gone.
+	await new Promise((r) => setTimeout(r, 50));
+	assert.strictEqual(
+		resolved,
+		false,
+		'onRequest resolved before any body byte — browser would paint blank',
+	);
+
+	release();
+	const html = await (await pending).text();
+	await Promise.all(c.pending);
+	assert.match(html, /<body>late<\/body>/);
+});
+
 await check('all models failing serves the emergency page', async () => {
 	stubFetch([], { ok: false, status: 429 });
 	const c = ctx('https://x.dev/anything', KEY);

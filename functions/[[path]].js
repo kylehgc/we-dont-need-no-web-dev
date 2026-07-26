@@ -207,6 +207,31 @@ function streamLLMResponse(
 	return readable;
 }
 
+// Cloudflare flushes response headers as soon as you return a streaming body, so
+// the browser commits the navigation and paints a blank page while the model is
+// still thinking. Holding the response until the first byte keeps the browser in
+// its "waiting for document" state instead — the behaviour this had on Vercel.
+// Costs nothing: the pump is already running, we just delay the headers.
+async function untilFirstByte(readable) {
+	const reader = readable.getReader();
+	const first = await reader.read();
+
+	return new ReadableStream({
+		start(controller) {
+			if (first.done) controller.close();
+			else controller.enqueue(first.value);
+		},
+		async pull(controller) {
+			const { done, value } = await reader.read();
+			if (done) controller.close();
+			else controller.enqueue(value);
+		},
+		cancel(reason) {
+			return reader.cancel(reason);
+		},
+	});
+}
+
 // The padding comment pushes the initial chunk past mobile browser buffering thresholds (~1KB).
 function docsHtmlPrefix(modelName) {
 	return `<!DOCTYPE html>
@@ -593,12 +618,8 @@ export async function onRequest({ request, env, waitUntil }) {
 		}
 
 		const modelMeta = `<meta name="x-model" content="${escapeHtml(modelUsed || 'unknown')}">`;
-		const readable = streamLLMResponse(
-			res,
-			null,
-			analytics,
-			modelMeta,
-			waitUntil,
+		const readable = await untilFirstByte(
+			streamLLMResponse(res, null, analytics, modelMeta, waitUntil),
 		);
 		return new Response(readable, {
 			headers: {
