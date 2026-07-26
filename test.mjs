@@ -313,12 +313,40 @@ await check('final token without trailing newline is not dropped', async () => {
 	assert.match(html, /<body>tail<\/body>/);
 });
 
-await check('zero-token 200 serves the emergency page, not a blank 200', async () => {
-	stubFetch([]); // opens fine, closes with [DONE] and no content tokens
+await check('zero-token 200: strikes the zombie, retries, then emergency page', async () => {
+	let fetches = 0;
+	globalThis.fetch = async () => {
+		fetches++;
+		return new Response(sseStream([]), { status: 200 }); // 200, no tokens, ever
+	};
 	const c = ctx('https://x.dev/empty-win', KEY);
 	const res = await onRequest(c);
-	assert.strictEqual(res.headers.get('X-LLM-Fallback'), 'first-byte-timeout');
+	assert.strictEqual(res.headers.get('X-LLM-Fallback'), 'all-models-failed');
+	assert.match(res.headers.get('X-LLM-Failures'), /no output before timeout/);
 	assert.match(await res.text(), /LLM OUTAGE/);
+	assert.strictEqual(fetches, 4, 'every model should get one shot at a zombie-only outage');
+});
+
+await check('zombie winner falls through to the next model, not the emergency page', async () => {
+	// Model 1 returns 200 then never emits a byte; model 2 serves a real page.
+	// FIRST_BYTE_TIMEOUT_MS is env-tunable so this test fails in ms, not 15s.
+	let call = 0;
+	const encoder = new TextEncoder();
+	globalThis.fetch = async () => {
+		call++;
+		if (call === 1) {
+			return new Response(new ReadableStream({ start() {} }), { status: 200 });
+		}
+		return new Response(sseStream(PAGE), { status: 200 });
+	};
+	const c = ctx('https://x.dev/zombie', { ...KEY, FIRST_BYTE_TIMEOUT_MS: '100' });
+	const res = await onRequest(c);
+	const html = await res.text();
+	await Promise.all(c.pending).catch(() => {});
+	assert.strictEqual(res.headers.get('X-LLM-Fallback'), null, 'should not be a fallback page');
+	assert.match(html, /<body>ok<\/body>/);
+	assert.match(res.headers.get('X-LLM-Failures'), /no output before timeout/);
+	assert.strictEqual(call, 2);
 });
 
 await check('scanner probes get a cheap 404 and never touch the model', async () => {

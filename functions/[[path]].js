@@ -119,6 +119,14 @@ function streamLLMResponse(
 		let headInjected = !injectInHead;
 		let sawDone = false;
 
+		// Resolves once the downstream side is gone (client disconnect, watchdog
+		// cancel). Raced against every upstream read so a silent model can't
+		// leave this pump blocked on read() holding an outbound connection.
+		const downstreamGone = writer.closed.then(
+			() => true,
+			() => true,
+		);
+
 		// Route one token's worth of output through the head-scan and tail
 		// buffers; returns the substring that is ready to leave the function.
 		const absorb = (output) => {
@@ -175,7 +183,15 @@ function streamLLMResponse(
 
 		try {
 			while (!sawDone) {
-				const { done, value } = await reader.read();
+				const next = await Promise.race([
+					reader.read().then((r) => ({ r })),
+					downstreamGone.then(() => null),
+				]);
+				if (!next) {
+					reader.cancel().catch(() => {});
+					return;
+				}
+				const { done, value } = next.r;
 				if (done) break;
 
 				buffer += decoder.decode(value, { stream: true });
@@ -195,40 +211,48 @@ function streamLLMResponse(
 				if (batch) await writer.write(encoder.encode(batch));
 			}
 		} catch (err) {
-			await writer.write(
-				encoder.encode(
-					transformChunk
-						? transformChunk(`\n[stream error: ${err.message}]`)
-						: `<!-- stream error: ${err.message} -->`,
-				),
-			);
+			// Best-effort: if the writer itself is what failed (client gone,
+			// downstream cancelled), these writes reject too — swallow them so the
+			// pump promise never becomes an unhandled rejection.
+			try {
+				await writer.write(
+					encoder.encode(
+						transformChunk
+							? transformChunk(`\n[stream error: ${err.message}]`)
+							: `<!-- stream error: ${err.message} -->`,
+					),
+				);
+			} catch {}
 		} finally {
-			// Flush any remaining head-scan buffer
-			if (headBuf) {
-				if (injectBeforeClose) {
-					tail += headBuf;
-				} else {
-					await writer.write(encoder.encode(headBuf));
+			try {
+				// Flush any remaining head-scan buffer
+				if (headBuf) {
+					if (injectBeforeClose) {
+						tail += headBuf;
+					} else {
+						await writer.write(encoder.encode(headBuf));
+					}
 				}
-				headBuf = '';
-			}
 
-			if (injectBeforeClose && tail) {
-				const lower = tail.toLowerCase();
-				const idx = lower.lastIndexOf('</body');
-				const fallback = idx === -1 ? lower.lastIndexOf('</html') : idx;
-				if (fallback !== -1) {
-					await writer.write(encoder.encode(tail.slice(0, fallback)));
-					await writer.write(encoder.encode(injectBeforeClose));
-					await writer.write(encoder.encode(tail.slice(fallback)));
-				} else {
+				if (injectBeforeClose && tail) {
+					const lower = tail.toLowerCase();
+					const idx = lower.lastIndexOf('</body');
+					const fallback = idx === -1 ? lower.lastIndexOf('</html') : idx;
+					if (fallback !== -1) {
+						await writer.write(encoder.encode(tail.slice(0, fallback)));
+						await writer.write(encoder.encode(injectBeforeClose));
+						await writer.write(encoder.encode(tail.slice(fallback)));
+					} else {
+						await writer.write(encoder.encode(tail));
+						await writer.write(encoder.encode(injectBeforeClose));
+					}
+				} else if (tail) {
 					await writer.write(encoder.encode(tail));
-					await writer.write(encoder.encode(injectBeforeClose));
 				}
-			} else if (tail) {
-				await writer.write(encoder.encode(tail));
+				await writer.close();
+			} catch {
+				// Downstream already errored or was cancelled — nothing to flush to.
 			}
-			await writer.close();
 		}
 	})();
 
@@ -249,13 +273,13 @@ function streamLLMResponse(
 // a model that returns 200 and then goes silent would otherwise hold this await
 // (and the request) forever. The watchdog turns both that hang and a zero-token
 // body into null, which the caller converts to the emergency page.
-async function untilFirstByte(readable) {
+async function untilFirstByte(readable, timeoutMs = FIRST_BYTE_TIMEOUT_MS) {
 	const reader = readable.getReader();
 	let watchdog;
 	const first = await Promise.race([
 		reader.read(),
 		new Promise((r) => {
-			watchdog = setTimeout(r, FIRST_BYTE_TIMEOUT_MS);
+			watchdog = setTimeout(r, timeoutMs);
 		}),
 	]);
 	clearTimeout(watchdog);
@@ -594,6 +618,8 @@ export async function onRequest({ request, env, waitUntil }) {
 	}
 
 	const analytics = analyticsScript(env.CF_BEACON_TOKEN);
+	// Dashboard-tunable without a redeploy (and injectable from the tests).
+	const firstByteMs = Number(env.FIRST_BYTE_TIMEOUT_MS) || FIRST_BYTE_TIMEOUT_MS;
 	const apiKey = url.searchParams.get('key') || env.OPENROUTER_API_KEY;
 	if (!apiKey) {
 		return new Response(
@@ -679,50 +705,54 @@ export async function onRequest({ request, env, waitUntil }) {
 			cleanSearch ? ` with query string: "?${cleanSearch}"` : ''
 		}. Generate a full HTML page for this path.`;
 
-		const { response: res, model: modelUsed, failures } = await callLLM(
-			apiKey,
-			models,
-			SITE_PROMPT,
-			userMessage,
-			4096,
-		);
+		// A race winner can still be a zombie: 200 headers, then no output before
+		// the first-byte watchdog fires (or a body that closes with zero tokens —
+		// a JSON error in an SSE costume). Seen in production on day one. When
+		// that happens, strike the zombie from the list and re-run the race with
+		// whatever models remain, rather than going straight to the emergency
+		// page while healthy models sit unused.
+		let remaining = models;
+		const failures = [];
+		let modelUsed = null;
+		let readable = null;
 
-		if (!res) {
-			const failureSummary = buildFailureSummary(failures);
-			return new Response(emergencyPageHtml(path, failureSummary, analytics), {
-				headers: {
-					...htmlHeaders('emergency-static-fallback', failures, analytics),
-					'X-LLM-Fallback': 'all-models-failed',
-				},
-			});
+		while (!readable && remaining.length) {
+			const attempt = await callLLM(
+				apiKey,
+				remaining,
+				SITE_PROMPT,
+				userMessage,
+				4096,
+			);
+			failures.push(...attempt.failures);
+			if (!attempt.response) break;
+
+			modelUsed = attempt.model;
+			const modelMeta = `<meta name="x-model" content="${escapeHtml(modelUsed)}">`;
+			readable = await untilFirstByte(
+				streamLLMResponse(attempt.response, null, analytics, modelMeta, waitUntil),
+				firstByteMs,
+			);
+			if (!readable) {
+				failures.push(formatFailureReason(modelUsed, 'no output before timeout'));
+				remaining = remaining.filter((m) => m !== modelUsed);
+			}
 		}
 
-		const modelMeta = `<meta name="x-model" content="${escapeHtml(modelUsed || 'unknown')}">`;
-		const readable = await untilFirstByte(
-			streamLLMResponse(res, null, analytics, modelMeta, waitUntil),
-		);
-
-		// The winner returned 200 but produced no output before the watchdog
-		// fired (or its body closed with zero tokens, e.g. a JSON error in an
-		// SSE costume). A blank 200 is the one thing this site must never serve.
 		if (!readable) {
 			return new Response(
-				emergencyPageHtml(
-					path,
-					formatFailureReason(modelUsed, 'no output before timeout'),
-					analytics,
-				),
+				emergencyPageHtml(path, buildFailureSummary(failures), analytics),
 				{
 					headers: {
-						...htmlHeaders('emergency-static-fallback', [], analytics),
-						'X-LLM-Fallback': 'first-byte-timeout',
+						...htmlHeaders('emergency-static-fallback', failures, analytics),
+						'X-LLM-Fallback': 'all-models-failed',
 					},
 				},
 			);
 		}
 
 		return new Response(readable, {
-			headers: htmlHeaders(modelUsed || 'unknown', failures, analytics),
+			headers: htmlHeaders(modelUsed, failures, analytics),
 		});
 	} catch (err) {
 		const failureSummary = buildFailureSummary(err.failures || []);
