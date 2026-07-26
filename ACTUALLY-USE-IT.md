@@ -138,7 +138,7 @@ Tunables (set as env vars in the dashboard, no redeploy needed):
 before it's disqualified; `HEDGE_MS` (default 2000) — the head start each lane
 gets before the next one opens.
 
-All three lanes ask for [`openrouter/free`](https://openrouter.ai/openrouter/free),
+The first two lanes name small, fast models directly; the last two ask [`openrouter/free`](https://openrouter.ai/openrouter/free),
 a router that picks at random from whatever free models exist at that moment and
 filters for the features the request needs. There is **no hardcoded model list**
 — an earlier version had one and it went three-of-four dead in a single day

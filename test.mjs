@@ -240,12 +240,31 @@ await check('?key= authenticates and is stripped from the prompt; ?long= raises 
 		{ effort: 'none', exclude: true },
 		'reasoning must be disabled and excluded — reasoning floods caused the zombie/CPU incidents',
 	);
-	assert.strictEqual(calls[0].body.model, 'openrouter/free', 'lanes must use the self-maintaining router');
-	assert.strictEqual(calls[0].body.max_tokens, 16384, '?long=true should raise the token budget');
+	assert.strictEqual(calls[0].body.max_tokens, 8192, '?long=true should raise the token budget');
+	assert.deepStrictEqual(
+		calls[0].body.provider,
+		{ sort: 'throughput', preferred_min_throughput: 40 },
+		'requests must bias toward fast providers',
+	);
 	const userMsg = calls[0].body.messages[1].content;
 	assert.ok(!userMsg.includes('sk-or-v1'), 'key leaked into the prompt');
 	assert.ok(!userMsg.includes('long=true'), 'long= leaked into the prompt');
 	assert.match(userMsg, /vibe=maximal/);
+});
+
+await check('fast models lead, router backstops the rot', async () => {
+	const calls = recordingFetch([
+		{ ok: false, status: 404 }, // pretend lane 0's slug was retired
+		{ ok: false, status: 404 }, // and lane 1's too
+		{ ok: true, chunks: PAGE }, // router lane carries the site
+	]);
+	const c = ctx('https://x.dev/rot-proof', { ...KEY, HEDGE_MS: '50' });
+	const res = await onRequest(c);
+	await res.text();
+	await Promise.all(c.pending).catch(() => {});
+	assert.ok(!calls[0].body.model.startsWith('openrouter/'), 'lane 0 should name a specific fast model');
+	assert.strictEqual(calls[2].body.model, 'openrouter/free', 'a router lane must backstop dead slugs');
+	assert.strictEqual(calls.length, 3);
 });
 
 await check('classifier model output is rejected, next lane serves the page', async () => {

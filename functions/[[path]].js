@@ -31,7 +31,25 @@ const SCANNER_PATHS =
 // maintain, and because each call re-rolls, the hedge lanes below naturally
 // land on different models — retry diversity for free.
 const FREE_ROUTER = 'openrouter/free';
-const LANES = [FREE_ROUTER, FREE_ROUTER, FREE_ROUTER, FREE_ROUTER];
+
+// Hybrid: bias the first lanes toward models that are actually quick, and keep
+// the router behind them so the site survives when those slugs rot.
+//
+// The router alone picks uniformly at random from the free pool, which is how
+// a 550B model ended up dribbling a page out at 14 tokens/sec. These two are
+// sparse MoE / small dense instruct models — few active parameters, so they
+// generate fast. If either is retired, that lane 404s instantly and the next
+// one opens immediately (a dead lane costs milliseconds, not a page).
+const LANES = [
+	'google/gemma-4-26b-a4b-it:free', // MoE, ~4B active
+	'nvidia/nemotron-nano-9b-v2:free', // small dense
+	FREE_ROUTER, // rot-proof backstop
+	FREE_ROUTER,
+];
+
+// Provider-level speed bias. OpenRouter defaults to load balancing on price;
+// this site would rather have the page now.
+const PROVIDER_PREFS = { sort: 'throughput', preferred_min_throughput: 40 };
 
 // The free pool is not all general-purpose chat models: it also holds safety
 // classifiers, vision encoders and code-completion models. A random roll can
@@ -58,10 +76,14 @@ function looksLikeProse(content, streamEnded) {
 	return streamEnded ? false : undefined;
 }
 
-// Reasoning models bill their hidden thinking against max_tokens, so a page can
-// run out of budget mid-<div> and arrive truncated. Headroom is cheap.
-const MAX_TOKENS = 8192;
-const MAX_TOKENS_LONG = 16384;
+// Deliberately modest. A big ceiling looked like free headroom, but OpenRouter
+// only routes to providers that can serve a response of the requested length,
+// so a large max_tokens quietly shrinks the provider pool and can strand the
+// request on a slow one. The truncation this was raised to fix turned out to be
+// reasoning tokens eating the budget, and reasoning is off now. A 1999 pastiche
+// page is ~1-2k tokens; this is ample.
+const MAX_TOKENS = 4096;
+const MAX_TOKENS_LONG = 8192;
 
 const SITE_PROMPT = `You are an unhinged web designer from 1999 who has time-traveled to the future.
 You work for a project called "we-dont-need-no-web-dev" (https://github.com/kylehgc/we-dont-need-no-web-dev).
@@ -504,6 +526,7 @@ function buildOpenRouterBody(model, systemPrompt, userMessage, maxTokens) {
 		max_tokens: maxTokens,
 		temperature: 0.7,
 		stream: true,
+		provider: PROVIDER_PREFS,
 		// These free models are reasoning models. Left alone they stream a long
 		// chain-of-thought as delta.reasoning before any delta.content: the page
 		// looks "zombie" while the model monologues, and parsing that flood of
