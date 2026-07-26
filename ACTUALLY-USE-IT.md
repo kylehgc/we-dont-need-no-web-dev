@@ -101,7 +101,7 @@ seeing `Error 1102`, the $5/mo Workers Paid plan raises it to 30s.
 
 | Param                        | Effect                                                                                       |
 | ---------------------------- | -------------------------------------------------------------------------------------------- |
-| `?long=true`                 | Doubles the token budget (16384 vs 8192) so pages get longer and more elaborate              |
+| `?long=true`                 | Doubles the token budget (8192 vs 4096) so pages get longer and more elaborate               |
 | `?model=provider/model-name` | Override the model — use any model ID from [OpenRouter models](https://openrouter.ai/models) |
 | `?key=sk-or-v1-xxx`          | Override the API key (useful for testing with your own key)                                  |
 
@@ -136,18 +136,36 @@ daily request cap is why losing lanes aren't fired preemptively.
 Tunables (set as env vars in the dashboard, no redeploy needed):
 `FIRST_BYTE_TIMEOUT_MS` (default 15000) — how long a lane may stay silent
 before it's disqualified; `HEDGE_MS` (default 2000) — the head start each lane
-gets before the next one opens.
+gets before the next one opens; `IDLE_TIMEOUT_MS` (default 20000) — longest gap
+tolerated between chunks once a stream is flowing, after which the server closes
+the document itself rather than leaving the browser spinning.
 
-The first two lanes name small, fast models directly; the last two ask [`openrouter/free`](https://openrouter.ai/openrouter/free),
-a router that picks at random from whatever free models exist at that moment and
-filters for the features the request needs. There is **no hardcoded model list**
-— an earlier version had one and it went three-of-four dead in a single day
-("This model is unavailable for free"), which collapsed every request onto one
-straggler. Because the router re-rolls per call, each hedge lane naturally lands
-on a different model, so retry diversity comes for free.
+Lanes 1–2 name small, fast models directly (sparse MoE / small dense — few
+active parameters, so they generate quickly). Lanes 3–4 ask
+[`openrouter/free`](https://openrouter.ai/openrouter/free), a router that picks
+at random from whatever free models exist at that moment.
+
+That split is deliberate. A pure hardcoded list rots — the original went
+three-of-four dead in a single day ("This model is unavailable for free"),
+collapsing every request onto one straggler. But the router alone picks
+uniformly at random, which once landed on a 550B model dribbling out a page at
+14 tokens/sec, and another time on a content-safety *classifier* that replied
+"User Safety: safe". So: named models for speed, router behind them for
+survival. A retired slug 404s instantly and the next lane opens immediately, so
+a dead lane costs milliseconds rather than a page.
+
+A lane also has to prove it's producing the *right kind* of output — HTML for
+the site, prose for `/docs/` — so classifiers, vision models and refusals are
+disqualified and re-rolled rather than served.
+
+Requests carry `provider: { sort: 'throughput', preferred_min_throughput: 40 }`.
+OpenRouter load balances on price by default; this site would rather have the
+page now. Related: keep `max_tokens` modest — OpenRouter only routes to
+providers that can serve a response of the requested length, so a large ceiling
+quietly shrinks the pool and can strand you on a slow provider.
 
 `X-Model` and the `x-model` meta tag report the model that *actually* served the
 page, not the router alias.
 
-If all three lanes fail, the server returns a built-in emergency page or docs
+If all four lanes fail, the server returns a built-in emergency page or docs
 page so the request still succeeds with something human-readable.
