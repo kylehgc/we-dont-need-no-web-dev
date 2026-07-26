@@ -11,6 +11,11 @@ const FIRST_BYTE_TIMEOUT_MS = 15000;
 // A lane of the model race opens this long after the previous one, unless the
 // previous lane has already failed outright (then the next opens immediately).
 const HEDGE_MS = 2000;
+// Once a stream is flowing, the longest gap tolerated between chunks. Free
+// models die mid-generation without closing the socket: the page freezes
+// half-written and the browser spins on "loading" forever. On idle we close
+// the document ourselves so the reader gets a finished (if short) page.
+const IDLE_TIMEOUT_MS = 20000;
 
 // Classic vuln-scanner probe shapes: server-side extensions this site will
 // never have, plus WordPress/phpMyAdmin prefixes and dotfile paths.
@@ -129,6 +134,7 @@ function streamLLMResponse(
 	injectBeforeClose,
 	injectInHead,
 	waitUntil,
+	idleMs = IDLE_TIMEOUT_MS,
 ) {
 	const TAIL_SIZE = 30;
 	const HEAD_WINDOW = 6; // length of "</head"
@@ -217,13 +223,28 @@ function streamLLMResponse(
 
 		try {
 			while (!sawDone) {
+				// Reset the idle clock per chunk: the limit is the gap between
+				// chunks, not the total generation time (a big model legitimately
+				// takes minutes to write a whole page).
+				let idleTimer;
+				const idle = new Promise((r) => {
+					idleTimer = setTimeout(() => r('idle'), idleMs);
+				});
 				const next = await Promise.race([
 					reader.read().then((r) => ({ r })),
 					downstreamGone.then(() => null),
-				]);
+					idle,
+				]).finally(() => clearTimeout(idleTimer));
+
 				if (!next) {
 					reader.cancel().catch(() => {});
 					return;
+				}
+				if (next === 'idle') {
+					// Model stalled mid-page. Stop waiting and let the finally block
+					// flush what we have and close the document.
+					reader.cancel().catch(() => {});
+					break;
 				}
 				const { done, value } = next.r;
 				if (done) break;
@@ -759,6 +780,7 @@ export async function onRequest({ request, env, waitUntil }) {
 	// Dashboard-tunable without a redeploy (and injectable from the tests).
 	const firstByteMs = Number(env.FIRST_BYTE_TIMEOUT_MS) || FIRST_BYTE_TIMEOUT_MS;
 	const hedgeMs = Number(env.HEDGE_MS) || HEDGE_MS;
+	const idleMs = Number(env.IDLE_TIMEOUT_MS) || IDLE_TIMEOUT_MS;
 	const apiKey = url.searchParams.get('key') || env.OPENROUTER_API_KEY;
 	if (!apiKey) {
 		return new Response(
@@ -806,7 +828,7 @@ export async function onRequest({ request, env, waitUntil }) {
 					// unhandled rejection. On failure, cancel the inner reader so
 					// the upstream body is released rather than streamed into a
 					// dead pipe.
-					const reader = streamLLMResponse(res, escapeHtml).getReader();
+					const reader = streamLLMResponse(res, escapeHtml, null, null, null, idleMs).getReader();
 					try {
 						await writer.write(
 							encoder.encode(docsHtmlPrefix(modelUsed || 'unknown')),
@@ -865,7 +887,7 @@ export async function onRequest({ request, env, waitUntil }) {
 		// The winner arrives pre-proven: its body already contains a real token,
 		// so returning here cannot flush headers for a page with no content.
 		const modelMeta = `<meta name="x-model" content="${escapeHtml(modelUsed)}">`;
-		const readable = streamLLMResponse(res, null, analytics, modelMeta, waitUntil);
+		const readable = streamLLMResponse(res, null, analytics, modelMeta, waitUntil, idleMs);
 		return new Response(readable, {
 			headers: htmlHeaders(modelUsed, failures, analytics),
 		});

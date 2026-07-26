@@ -296,6 +296,36 @@ await check('docs route still accepts plain prose', async () => {
 	assert.match(html, /just some plain text/);
 });
 
+await check('stream that stalls mid-page is closed, not left hanging', async () => {
+	// The production failure: a model streams a partial page, dies without
+	// sending [DONE], and never closes the socket. Before the idle guard the
+	// response never ended and the browser spun on "loading" forever.
+	const encoder = new TextEncoder();
+	globalThis.fetch = async () =>
+		new Response(
+			new ReadableStream({
+				start(controller) {
+					const payload = {
+						choices: [{ delta: { content: '<html><head></head><body><div>half a page' } }],
+					};
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n`));
+					// ...then the model dies. No [DONE], no close, ever.
+				},
+			}),
+		);
+	const c = ctx('https://x.dev/stalled', { ...KEY, IDLE_TIMEOUT_MS: '150' });
+	const res = await onRequest(c);
+	const html = await Promise.race([
+		res.text(),
+		new Promise((_, rej) =>
+			setTimeout(() => rej(new Error('response never ended — browser would hang')), 3000),
+		),
+	]);
+	await Promise.all(c.pending).catch(() => {});
+	assert.match(html, /half a page/, 'partial content must survive');
+	assert.match(html, /<\/body><\/html>$/, 'server must close the stalled document');
+});
+
 await check('truncated page gets its tags closed', async () => {
 	// Model runs out of budget mid-document: no </html> ever arrives.
 	stubFetch(['<!DOCTYPE html><html><head></head><body><div>cut off mid-']);
