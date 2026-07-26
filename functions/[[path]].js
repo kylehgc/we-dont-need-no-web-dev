@@ -17,20 +17,21 @@ const HEDGE_MS = 2000;
 const SCANNER_PATHS =
 	/\.(php\d?|aspx?|jsp|cgi|env|git|sql|bak|ini|config|ya?ml|lock|axd|xml)$|^\/(wp-|wordpress|phpmyadmin|xmlrpc|cgi-bin|vendor\/|\.)/i;
 
-// Free model availability drifts constantly, so spread across multiple providers.
-// Ordered by latency / throughput — fastest first so the happy path is snappy.
-const FAST_MODELS = [
-	'nvidia/nemotron-3-nano-30b-a3b:free',
-	'openai/gpt-oss-120b:free',
-	'minimax/minimax-m2.5:free',
-	'z-ai/glm-4.5-air:free',
-];
-const FULL_MODELS = [
-	'nvidia/nemotron-3-super-120b-a12b:free',
-	'openai/gpt-oss-120b:free',
-	'minimax/minimax-m2.5:free',
-	'z-ai/glm-4.5-air:free',
-];
+// Hardcoded free-model slugs rot, fast: this list went 3-of-4 dead in a single
+// day ("This model is unavailable for free"), which collapsed every request
+// onto one straggler and produced the emergency-page epidemic.
+//
+// openrouter/free is a router that picks at random from whatever free models
+// exist right now, filtering for the features a request needs. Nothing to
+// maintain, and because each call re-rolls, the hedge lanes below naturally
+// land on different models — retry diversity for free.
+const FREE_ROUTER = 'openrouter/free';
+const LANES = [FREE_ROUTER, FREE_ROUTER, FREE_ROUTER];
+
+// Reasoning models bill their hidden thinking against max_tokens, so a page can
+// run out of budget mid-<div> and arrive truncated. Headroom is cheap.
+const MAX_TOKENS = 8192;
+const MAX_TOKENS_LONG = 16384;
 
 const SITE_PROMPT = `You are an unhinged web designer from 1999 who has time-traveled to the future.
 You work for a project called "we-dont-need-no-web-dev" (https://github.com/kylehgc/we-dont-need-no-web-dev).
@@ -155,6 +156,11 @@ function streamLLMResponse(
 			return output;
 		};
 
+		// Tracks whether the model ever closed the document. A truncated page
+		// (budget exhausted mid-tag) otherwise leaves the browser parsing an
+		// unterminated element and showing a blank or half-styled mess.
+		let sawHtmlClose = false;
+
 		const drainLines = (lines) => {
 			// One encoded write per network chunk, not per token — the per-token
 			// writes were the biggest avoidable cost against the 10ms CPU budget.
@@ -173,7 +179,10 @@ function streamLLMResponse(
 
 				try {
 					const token = JSON.parse(data).choices?.[0]?.delta?.content;
-					if (token) batch += absorb(transformChunk ? transformChunk(token) : token);
+					if (token) {
+						if (token.includes('</html')) sawHtmlClose = true;
+						batch += absorb(transformChunk ? transformChunk(token) : token);
+					}
 				} catch {
 					// Skip malformed SSE chunks and keep streaming.
 				}
@@ -249,6 +258,17 @@ function streamLLMResponse(
 				} else if (tail) {
 					await writer.write(encoder.encode(tail));
 				}
+
+				// Truncated mid-document: close the tags ourselves so the browser
+				// renders what did arrive instead of choking on an open element.
+				// transformChunk means the docs route, which owns its own shell.
+				if (!sawHtmlClose && !transformChunk) {
+					await writer.write(
+						encoder.encode(
+							'\n<!-- generation ran out of budget mid-page; closing tags added by the server -->\n</body></html>',
+						),
+					);
+				}
 				await writer.close();
 			} catch {
 				// Downstream already errored or was cancelled — nothing to flush to.
@@ -274,6 +294,7 @@ function streamLLMResponse(
 // instead of painting a blank committed page: the Response isn't constructed —
 // so headers can't flush — until real content provably exists.
 async function proveFirstToken(res, timeoutMs) {
+	if (!res.body) return null;
 	const reader = res.body.getReader();
 	const chunks = [];
 	const decoder = new TextDecoder();
@@ -284,15 +305,18 @@ async function proveFirstToken(res, timeoutMs) {
 	});
 
 	// Same parse the pump uses: a "data:" line whose delta has non-empty
-	// content. Keep-alive comment lines (": ...") never match.
+	// content. Keep-alive comment lines (": ...") never match. Also captures
+	// the real model slug, since openrouter/free hides it behind the router.
+	let servedBy = null;
 	const hasToken = (lines) => {
 		for (const line of lines) {
 			const trimmed = line.trim();
 			if (!trimmed.startsWith('data: ') || trimmed === 'data: [DONE]')
 				continue;
 			try {
-				if (JSON.parse(trimmed.slice(6)).choices?.[0]?.delta?.content)
-					return true;
+				const json = JSON.parse(trimmed.slice(6));
+				if (json.model) servedBy = json.model;
+				if (json.choices?.[0]?.delta?.content) return true;
 			} catch {
 				// Malformed line — keep scanning.
 			}
@@ -302,6 +326,7 @@ async function proveFirstToken(res, timeoutMs) {
 
 	// Replays the buffered proof bytes, then hands over to the live tail.
 	const provenBody = () => ({
+		servedBy,
 		body: new ReadableStream({
 			start(controller) {
 				for (const c of chunks) controller.enqueue(c);
@@ -503,12 +528,14 @@ function emergencyDocsText(failureSummary) {
 		`- a free chat model generates an entire HTML page on the fly\n` +
 		`- there are no static frontend files for normal routes\n\n` +
 		`What changed:\n` +
-		`- the server runs a hedged race: the fastest free model goes first, and\n` +
-		`  another provider joins only if it stalls for a couple of seconds or fails\n` +
+		`- models come from the openrouter/free router now, not a hardcoded list\n` +
+		`  that rotted out from under the site\n` +
+		`- the server runs a hedged race: one lane goes first, and another joins\n` +
+		`  only if it stalls for a couple of seconds or fails\n` +
 		`- timeout, rate limit, missing-model, and upstream 5xx failures open the next lane immediately\n` +
 		`- if every free model fails, the server still returns a backup page instead of a raw error\n\n` +
 		`Power user knobs:\n` +
-		`- ?long=true asks for the more expensive free-model chain\n` +
+		`- ?long=true doubles the token budget so pages get longer\n` +
 		`- ?model=provider/model-name forces a specific model\n` +
 		`- ?key=sk-or-v1-... overrides the server key for testing\n\n` +
 		`Latest failure summary: ${failureSummary}\n\n` +
@@ -581,7 +608,7 @@ async function callLLM(
 			];
 			throw error;
 		}
-		return { response: proven, model: models[0], failures: [] };
+		return { response: proven, model: proven.servedBy || models[0], failures: [] };
 	}
 
 	// Hedged race to the first proven token. Two hard lessons baked in:
@@ -635,7 +662,7 @@ async function callLLM(
 					winnerChosen = true;
 					// Keep the failures accumulated so far — the X-LLM-Failures
 					// header reports which lanes died on the way to the winner.
-					settle({ response: proven, model, failures });
+					settle({ response: proven, model: proven.servedBy || model, failures });
 				})
 				.catch((err) => {
 					failures.push(
@@ -707,10 +734,10 @@ export async function onRequest({ request, env, waitUntil }) {
 		if (isDocs) {
 			const { response: res, model: modelUsed, failures } = await callLLM(
 				apiKey,
-				customModel ? [customModel] : FAST_MODELS,
+				customModel ? [customModel] : LANES,
 				DOCS_PROMPT,
 				'Explain how this website works. Be meta. Be funny.',
-				2048,
+				4096,
 				{ firstByteMs, hedgeMs },
 			);
 
@@ -761,11 +788,7 @@ export async function onRequest({ request, env, waitUntil }) {
 			});
 		}
 
-		const models = customModel
-			? [customModel]
-			: useLong
-				? FULL_MODELS
-				: FAST_MODELS;
+		const models = customModel ? [customModel] : LANES;
 
 		const cleanParams = new URLSearchParams(url.searchParams);
 		cleanParams.delete('key');
@@ -782,7 +805,7 @@ export async function onRequest({ request, env, waitUntil }) {
 			models,
 			SITE_PROMPT,
 			userMessage,
-			4096,
+			useLong ? MAX_TOKENS_LONG : MAX_TOKENS,
 			{ firstByteMs, hedgeMs },
 		);
 

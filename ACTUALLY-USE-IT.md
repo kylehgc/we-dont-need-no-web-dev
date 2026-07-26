@@ -101,7 +101,7 @@ seeing `Error 1102`, the $5/mo Workers Paid plan raises it to 30s.
 
 | Param                        | Effect                                                                                       |
 | ---------------------------- | -------------------------------------------------------------------------------------------- |
-| `?long=true`                 | Starts the model chain with a larger, slower model (NVIDIA Nemotron 3 Super 120B)            |
+| `?long=true`                 | Doubles the token budget (16384 vs 8192) so pages get longer and more elaborate              |
 | `?model=provider/model-name` | Override the model — use any model ID from [OpenRouter models](https://openrouter.ai/models) |
 | `?key=sk-or-v1-xxx`          | Override the API key (useful for testing with your own key)                                  |
 
@@ -138,23 +138,16 @@ Tunables (set as env vars in the dashboard, no redeploy needed):
 before it's disqualified; `HEDGE_MS` (default 2000) — the head start each lane
 gets before the next one opens.
 
-**Fast (default):**
+All three lanes ask for [`openrouter/free`](https://openrouter.ai/openrouter/free),
+a router that picks at random from whatever free models exist at that moment and
+filters for the features the request needs. There is **no hardcoded model list**
+— an earlier version had one and it went three-of-four dead in a single day
+("This model is unavailable for free"), which collapsed every request onto one
+straggler. Because the router re-rolls per call, each hedge lane naturally lands
+on a different model, so retry diversity comes for free.
 
-1. `nvidia/nemotron-3-nano-30b-a3b:free`
-2. `openai/gpt-oss-120b:free`
-3. `minimax/minimax-m2.5:free`
-4. `z-ai/glm-4.5-air:free`
+`X-Model` and the `x-model` meta tag report the model that *actually* served the
+page, not the router alias.
 
-Order matters now: lane 1 is the model you actually expect to serve most
-traffic, the rest are insurance.
-
-**Full (`?long=true`):**
-
-1. `nvidia/nemotron-3-super-120b-a12b:free`
-2. `openai/gpt-oss-120b:free`
-3. `minimax/minimax-m2.5:free`
-4. `z-ai/glm-4.5-air:free`
-
-Check [openrouter.ai/models?q=free](https://openrouter.ai/models?q=free) for the current free model list — these change over time.
-
-If every model in the chain fails, the server returns a built-in emergency page or docs page so the request still succeeds with something human-readable.
+If all three lanes fail, the server returns a built-in emergency page or docs
+page so the request still succeeds with something human-readable.

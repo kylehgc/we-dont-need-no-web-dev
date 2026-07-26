@@ -229,7 +229,7 @@ await check('?model= failure surfaces upstream status, no fallback', async () =>
 	assert.match(await res.text(), /Server error/);
 });
 
-await check('?key= is used for auth and stripped from the prompt; ?long= picks FULL_MODELS', async () => {
+await check('?key= authenticates and is stripped from the prompt; ?long= raises the budget', async () => {
 	const calls = recordingFetch([{ ok: true, chunks: PAGE }]);
 	const c = ctx('https://x.dev/some/page?key=sk-or-v1-visitor&long=true&vibe=maximal', {});
 	await (await onRequest(c)).text();
@@ -240,11 +240,56 @@ await check('?key= is used for auth and stripped from the prompt; ?long= picks F
 		{ effort: 'none', exclude: true },
 		'reasoning must be disabled and excluded — reasoning floods caused the zombie/CPU incidents',
 	);
+	assert.strictEqual(calls[0].body.model, 'openrouter/free', 'lanes must use the self-maintaining router');
+	assert.strictEqual(calls[0].body.max_tokens, 16384, '?long=true should raise the token budget');
 	const userMsg = calls[0].body.messages[1].content;
 	assert.ok(!userMsg.includes('sk-or-v1'), 'key leaked into the prompt');
 	assert.ok(!userMsg.includes('long=true'), 'long= leaked into the prompt');
 	assert.match(userMsg, /vibe=maximal/);
-	assert.match(calls[0].body.model, /nemotron-3-super/, 'long=true should start with the FULL_MODELS chain');
+});
+
+await check('truncated page gets its tags closed', async () => {
+	// Model runs out of budget mid-document: no </html> ever arrives.
+	stubFetch(['<!DOCTYPE html><html><head></head><body><div>cut off mid-']);
+	const c = ctx('https://x.dev/truncated', KEY);
+	const html = await (await onRequest(c)).text();
+	await Promise.all(c.pending);
+	assert.match(html, /cut off mid-/, 'partial content must survive');
+	assert.match(html, /<\/body><\/html>$/, 'server must close the document');
+	assert.match(html, /ran out of budget/);
+});
+
+await check('complete page is not double-closed', async () => {
+	stubFetch(['<!DOCTYPE html><html><head></head><body>fine</body></html>']);
+	const c = ctx('https://x.dev/complete', KEY);
+	const html = await (await onRequest(c)).text();
+	await Promise.all(c.pending);
+	assert.strictEqual(html.match(/<\/html>/g).length, 1, 'closing tag added to an already-closed page');
+	assert.ok(!html.includes('ran out of budget'));
+});
+
+await check('real model slug is reported, not the router alias', async () => {
+	const encoder = new TextEncoder();
+	globalThis.fetch = async () =>
+		new Response(
+			new ReadableStream({
+				start(controller) {
+					const payload = {
+						model: 'google/gemma-4-31b-it:free',
+						choices: [{ delta: { content: '<html><head></head><body>hi</body></html>' } }],
+					};
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n`));
+					controller.enqueue(encoder.encode('data: [DONE]\n'));
+					controller.close();
+				},
+			}),
+		);
+	const c = ctx('https://x.dev/whodunnit', KEY);
+	const res = await onRequest(c);
+	const html = await res.text();
+	await Promise.all(c.pending);
+	assert.strictEqual(res.headers.get('X-Model'), 'google/gemma-4-31b-it:free');
+	assert.match(html, /content="google\/gemma-4-31b-it:free"/);
 });
 
 await check('docs output is HTML-escaped against a hostile model', async () => {
@@ -336,7 +381,7 @@ await check('all models tokenless: every lane gets one shot, then emergency page
 	assert.strictEqual(res.headers.get('X-LLM-Fallback'), 'all-models-failed');
 	assert.match(res.headers.get('X-LLM-Failures'), /no output before timeout/);
 	assert.match(await res.text(), /LLM OUTAGE/);
-	assert.strictEqual(fetches, 4, 'every model should get one shot at a zombie-only outage');
+	assert.strictEqual(fetches, 3, 'every lane should get one shot at a zombie-only outage');
 });
 
 await check('a zombie lane cannot win the race — first proven token takes it', async () => {
