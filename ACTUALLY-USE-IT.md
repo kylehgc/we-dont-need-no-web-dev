@@ -15,47 +15,79 @@ git clone https://github.com/kylehgc/we-dont-need-no-web-dev.git
 cd we-dont-need-no-web-dev
 
 # Set your OpenRouter API key
-export OPENROUTER_API_KEY=sk-or-v1-your-key-here
-
-# Install Vercel CLI if you don't have it
-npm i -g vercel
+cp .dev.vars.example .dev.vars
+# then edit .dev.vars and paste your key in
 
 # Run the dev server
-vercel dev
+npm run dev
 ```
 
-Visit `http://localhost:3000` — or any path you want.
+Visit `http://localhost:8788` — or any path you want.
 
-## Deploy to Vercel
+> **Windows on ARM64:** `wrangler dev` won't run. It depends on `workerd`, which
+> Cloudflare doesn't ship a `win32-arm64` build for. Use `npm test` for local
+> verification and deploy to a preview branch for the real thing.
 
-### Option A: CLI
+## Tests
 
 ```bash
-vercel --prod
+npm test
 ```
 
-### Option B: Dashboard
+Stubs `fetch` with a fake OpenRouter stream and checks routing, streaming,
+script injection, and the emergency fallback. No key or network needed.
+
+## Deploy to Cloudflare Pages
+
+### Option A: Dashboard (recommended)
 
 1. Push to GitHub
-2. Go to [vercel.com/new](https://vercel.com/new)
-3. Import the repo
-4. It just works — no build config needed
+2. Go to [Cloudflare dashboard → Workers & Pages → Create → Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages/create/pages)
+3. Connect the repo
+4. Leave **build command** empty and set **build output directory** to `public`
+5. Deploy — `functions/[[path]].js` is picked up automatically, no build step
+
+`public/` is intentionally empty. Anything you put there is served as a static
+file and shadows the function, and pointing the output directory at the repo
+root would publish `README.md`, `package.json`, and friends.
+
+### Option B: CLI
+
+```bash
+npx wrangler pages deploy public
+```
 
 ### Set the Environment Variable
 
-In your Vercel project: **Settings → Environment Variables**
+In your Pages project: **Settings → Variables and Secrets**
 
-| Key                  | Value                    |
-| -------------------- | ------------------------ |
-| `OPENROUTER_API_KEY` | `sk-or-v1-your-key-here` |
+| Key                  | Type   | Value                      |
+| -------------------- | ------ | -------------------------- |
+| `OPENROUTER_API_KEY` | Secret | `sk-or-v1-your-key-here`   |
+| `CF_BEACON_TOKEN`    | Text   | (optional, see below)      |
 
-Or via CLI:
+Add it to **both** Production and Preview, then redeploy.
 
-```bash
-vercel env add OPENROUTER_API_KEY production
-```
+## Analytics (optional)
 
-Then redeploy: `vercel --prod`
+Cloudflare Web Analytics is off unless you set `CF_BEACON_TOKEN`. Grab a token
+from **Cloudflare dashboard → Analytics & Logs → Web Analytics**, add it as a
+variable, and the beacon gets injected before `</body>`. Leave it unset and no
+script tag is emitted at all — which is arguably more in the spirit of a site
+that claims to ship no JavaScript.
+
+## Keeping the bill at zero
+
+Every crawler hit is a full LLM generation, which is how the previous host's
+usage limits got eaten. Two guards:
+
+- `/robots.txt` is served directly by the function and disallows everything but `/`.
+- Turn on **Bot Fight Mode** in the Cloudflare dashboard under **Security → Bots**.
+
+Cloudflare's free tier gives 100k requests/day and unmetered bandwidth. The one
+limit worth watching is **10ms CPU per request** — time spent waiting on
+OpenRouter doesn't count, but the per-token stream transform does. If you start
+seeing `Error 1102`, the $5/mo Workers Paid plan raises it to 30s.
 
 ## Query Parameters
 
@@ -69,14 +101,17 @@ Then redeploy: `vercel --prod`
 
 ```
 .
-├── api/
-│   └── index.js        # The one and only serverless edge function
-├── vercel.json          # Routes all requests to the edge function
+├── functions/
+│   └── [[path]].js       # The one and only function. Catch-all — the filename IS the router.
+├── public/               # Deliberately empty. Pages needs a build output dir.
 ├── package.json
-├── .env.example         # Template for environment variables
-├── README.md            # The unhinged one
-└── ACTUALLY-USE-IT.md   # You are here
+├── .dev.vars.example     # Template for local environment variables
+├── README.md             # The unhinged one
+└── ACTUALLY-USE-IT.md    # You are here
 ```
+
+There is no `vercel.json` equivalent. `[[path]]` is Cloudflare's catch-all
+convention, so every route lands in that one file with no config.
 
 ## Free Models (Fallback Chain)
 

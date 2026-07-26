@@ -1,0 +1,5 @@
+# Copy to .dev.vars for local `wrangler pages dev`.
+# In production these live in Pages -> Settings -> Variables and Secrets.
+OPENROUTER_API_KEY=
+# Optional. Unset means no analytics script is injected at all.
+CF_BEACON_TOKEN=

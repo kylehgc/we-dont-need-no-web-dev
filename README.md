@@ -11,7 +11,7 @@ Every. Single. Request. Fresh HTML. Fresh CSS. Marquees. Comic Sans. Gradients t
 
 | Layer             | Technology                                                                                  |
 | ----------------- | ------------------------------------------------------------------------------------------- |
-| **Runtime**       | Vercel Edge Functions (free tier, because we have standards)                                |
+| **Runtime**       | Cloudflare Pages Functions (free tier, because we have standards)                           |
 | **LLM**           | A rotating pile of free [OpenRouter](https://openrouter.ai) models with fallback logic       |
 | **Frontend**      | LMAO                                                                                        |
 | **CSS Framework** | The AI's unmedicated imagination                                                            |
@@ -38,7 +38,7 @@ Every. Single. Request. Fresh HTML. Fresh CSS. Marquees. Comic Sans. Gradients t
 ## How It Works
 
 1. A request comes in. Any request. Any path.
-2. A Vercel Edge Function catches it like a net catches a confused bird.
+2. A Cloudflare Pages Function catches it like a net catches a confused bird.
 3. The URL path gets sent to a free LLM on OpenRouter with a system prompt telling it to be a 90s web designer who's lost their mind.
 4. The LLM generates a complete `<!DOCTYPE html>` page with inline CSS. Streaming. Live.
 5. The browser renders this fresh-from-the-oven HTML as it arrives.
@@ -48,7 +48,7 @@ Every. Single. Request. Fresh HTML. Fresh CSS. Marquees. Comic Sans. Gradients t
 
 ```
 ┌──────────┐     ┌─────────────────┐     ┌──────────────┐
-│ Browser  │────▶│ Vercel Edge Fn  │────▶│  OpenRouter   │
+│ Browser  │────▶│ CF Pages Fn     │────▶│  OpenRouter   │
 │ (victim) │◀────│ (the middleman) │◀────│  (the brain)  │
 └──────────┘     └─────────────────┘     └──────────────┘
                          │
@@ -74,7 +74,7 @@ A: Then you get to see something broken. Refresh and it'll be different broken. 
 A: The API key is server-side. The LLM is told not to generate JavaScript. If it does anyway, well, that's between you and your browser.
 
 **Q: How much does this cost to run?**
-A: $0. Vercel free tier + OpenRouter free models. We are running a production website on hopes, dreams, and other people's GPUs.
+A: $0. Cloudflare free tier + OpenRouter free models. We are running a production website on hopes, dreams, and other people's GPUs.
 
 **Q: Can I actually deploy this myself?**
 A: [Yes, unfortunately.](ACTUALLY-USE-IT.md)

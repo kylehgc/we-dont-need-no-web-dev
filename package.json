@@ -2,7 +2,11 @@
 	"name": "we-dont-need-no-web-dev",
 	"version": "1.0.0",
 	"private": true,
-	"scripts": {},
-	"dependencies": {
-	}
+	"type": "module",
+	"scripts": {
+		"dev": "npx wrangler pages dev public",
+		"deploy": "npx wrangler pages deploy public",
+		"test": "node test.mjs"
+	},
+	"dependencies": {}
 }

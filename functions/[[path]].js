@@ -1,5 +1,3 @@
-export const config = { runtime: 'edge' };
-
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_HEADERS = {
 	'Content-Type': 'application/json',
@@ -93,6 +91,7 @@ function streamLLMResponse(
 	transformChunk,
 	injectBeforeClose,
 	injectInHead,
+	waitUntil,
 ) {
 	const TAIL_SIZE = 30;
 	const HEAD_WINDOW = 6; // length of "</head"
@@ -101,7 +100,7 @@ function streamLLMResponse(
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
 
-	(async () => {
+	const pump = (async () => {
 		const reader = apiRes.body.getReader();
 		let buffer = '';
 		let tail = '';
@@ -201,6 +200,10 @@ function streamLLMResponse(
 		}
 	})();
 
+	// Keep the pump alive past the point Workers has flushed response headers.
+	// The docs path wraps its own outer pump instead, so this is optional.
+	waitUntil?.(pump);
+
 	return readable;
 }
 
@@ -222,9 +225,16 @@ h1{text-align:center;font-size:1.4rem;margin-bottom:2rem;color:#00ff41;text-shad
 <pre>`;
 }
 
-const ANALYTICS_SCRIPT = `<script defer src="/_vercel/insights/script.js"></script>`;
+// Cloudflare Web Analytics. Set CF_BEACON_TOKEN to enable; unset means no script at all.
+function analyticsScript(token) {
+	return token
+		? `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token":"${escapeHtml(token)}"}'></script>`
+		: '';
+}
 
-const DOCS_HTML_SUFFIX = `<span class="cursor"></span></pre>${ANALYTICS_SCRIPT}</body></html>`;
+function docsHtmlSuffix(analytics) {
+	return `<span class="cursor"></span></pre>${analytics}</body></html>`;
+}
 
 function escapeHtml(str) {
 	return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -262,7 +272,7 @@ function buildFailureSummary(failures) {
 	return failures.slice(0, 4).join(' | ') || 'unknown failure';
 }
 
-function emergencyPageHtml(path, failureSummary) {
+function emergencyPageHtml(path, failureSummary, analytics) {
 	const safePath = escapeHtml(path || '/');
 	const safeSummary = escapeHtml(failureSummary);
 
@@ -314,7 +324,7 @@ footer{margin-top:1.3rem;font-size:.9rem;color:#ffe8b8}
 		<footer><!-- hidden joke: this static page is now technically the most stable frontend in the repo -->Powered by contingency plans, bad decisions, and one defensive programmer.</footer>
 	</section>
 </main>
-${ANALYTICS_SCRIPT}
+${analytics}
 </body>
 </html>`;
 }
@@ -324,7 +334,7 @@ function emergencyDocsText(failureSummary) {
 		`we-dont-need-no-web-dev emergency docs\n\n` +
 		`The AI docs page failed to manifest, so this backup note is filling in.\n\n` +
 		`How the site usually works:\n` +
-		`- every request hits the edge function\n` +
+		`- every request hits the Cloudflare Pages function\n` +
 		`- the URL path is sent to OpenRouter\n` +
 		`- a free chat model generates an entire HTML page on the fly\n` +
 		`- there are no static frontend files for normal routes\n\n` +
@@ -362,7 +372,6 @@ async function fetchChatCompletion(
 			body: buildOpenRouterBody(model, systemPrompt, userMessage, maxTokens),
 			signal: controller.signal,
 		});
-		res.modelUsed = model;
 		return res;
 	} finally {
 		clearTimeout(timeoutId);
@@ -389,7 +398,7 @@ async function callLLM(
 			userMessage,
 			maxTokens,
 		);
-		if (res.ok) return { response: res, failures: [] };
+		if (res.ok) return { response: res, model: models[0], failures: [] };
 		const errText = (await res.text()).slice(0, 240);
 		const error = new Error(`LLM API error: ${res.status} — ${errText}`);
 		error.status = res.status;
@@ -421,7 +430,15 @@ async function callLLM(
 
 	try {
 		const winner = await Promise.any(racePromises);
-		return { response: winner.response, failures: [] };
+		// Workers caps outbound connections at 6 — drop the losers instead of
+		// leaving their bodies unread for the life of the request.
+		for (const p of racePromises) {
+			p.then(
+				(r) => r.response !== winner.response && r.response.body?.cancel(),
+				() => {},
+			);
+		}
+		return { response: winner.response, model: winner.model, failures: [] };
 	} catch (aggErr) {
 		// All models failed — collect reasons.
 		const failures = (aggErr.errors || []).map((e) =>
@@ -435,11 +452,11 @@ async function callLLM(
 			error.failures = failures;
 			throw error;
 		}
-		return { response: null, failures };
+		return { response: null, model: null, failures };
 	}
 }
 
-export default async function handler(request) {
+export async function onRequest({ request, env, waitUntil }) {
 	const url = new URL(request.url);
 	const path = url.pathname;
 
@@ -447,7 +464,16 @@ export default async function handler(request) {
 		return new Response(null, { status: 204 });
 	}
 
-	const apiKey = url.searchParams.get('key') || process.env.OPENROUTER_API_KEY;
+	// Every crawler hit is a full LLM generation. Politely decline.
+	// Previously this path fell through and served a hallucinated robots.txt as HTML.
+	if (path === '/robots.txt') {
+		return new Response('User-agent: *\nDisallow: /\nAllow: /$\n', {
+			headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+		});
+	}
+
+	const analytics = analyticsScript(env.CF_BEACON_TOKEN);
+	const apiKey = url.searchParams.get('key') || env.OPENROUTER_API_KEY;
 	if (!apiKey) {
 		return new Response(
 			'OPENROUTER_API_KEY not configured and no ?key= provided',
@@ -461,7 +487,7 @@ export default async function handler(request) {
 
 	try {
 		if (isDocs) {
-			const { response: res, failures } = await callLLM(
+			const { response: res, model: modelUsed, failures } = await callLLM(
 				apiKey,
 				customModel ? [customModel] : FAST_MODELS,
 				DOCS_PROMPT,
@@ -473,7 +499,7 @@ export default async function handler(request) {
 			if (!res) {
 				const failureSummary = buildFailureSummary(failures);
 				return new Response(
-					`${docsHtmlPrefix('emergency-docs-fallback')}${escapeHtml(emergencyDocsText(failureSummary))}${DOCS_HTML_SUFFIX}`,
+					`${docsHtmlPrefix('emergency-docs-fallback')}${escapeHtml(emergencyDocsText(failureSummary))}${docsHtmlSuffix(analytics)}`,
 					{
 						headers: {
 							'Content-Type': 'text/html; charset=utf-8',
@@ -491,33 +517,35 @@ export default async function handler(request) {
 			const writer = writable.getWriter();
 			const encoder = new TextEncoder();
 
-			(async () => {
-				await writer.write(
-					encoder.encode(docsHtmlPrefix(res.modelUsed || 'unknown')),
-				);
+			waitUntil(
+				(async () => {
+					await writer.write(
+						encoder.encode(docsHtmlPrefix(modelUsed || 'unknown')),
+					);
 
-				const innerStream = streamLLMResponse(res, escapeHtml);
-				const reader = innerStream.getReader();
-				try {
-					while (true) {
-						const { done, value } = await reader.read();
-						if (done) break;
-						await writer.write(value);
+					const innerStream = streamLLMResponse(res, escapeHtml);
+					const reader = innerStream.getReader();
+					try {
+						while (true) {
+							const { done, value } = await reader.read();
+							if (done) break;
+							await writer.write(value);
+						}
+					} catch {
+						// Stream already ended.
 					}
-				} catch {
-					// Stream already ended.
-				}
 
-				await writer.write(encoder.encode(DOCS_HTML_SUFFIX));
-				await writer.close();
-			})();
+					await writer.write(encoder.encode(docsHtmlSuffix(analytics)));
+					await writer.close();
+				})(),
+			);
 
 			return new Response(readable, {
 				headers: {
 					'Content-Type': 'text/html; charset=utf-8',
 					'X-Content-Type-Options': 'nosniff',
 					'X-Powered-By': 'vibes',
-					'X-Model': res.modelUsed || 'unknown',
+					'X-Model': modelUsed || 'unknown',
 					...(failures.length
 						? { 'X-LLM-Failures': buildFailureSummary(failures) }
 						: {}),
@@ -541,7 +569,7 @@ export default async function handler(request) {
 			cleanSearch ? ` with query string: "?${cleanSearch}"` : ''
 		}. Generate a full HTML page for this path.`;
 
-		const { response: res, failures } = await callLLM(
+		const { response: res, model: modelUsed, failures } = await callLLM(
 			apiKey,
 			models,
 			SITE_PROMPT,
@@ -552,7 +580,7 @@ export default async function handler(request) {
 
 		if (!res) {
 			const failureSummary = buildFailureSummary(failures);
-			return new Response(emergencyPageHtml(path, failureSummary), {
+			return new Response(emergencyPageHtml(path, failureSummary, analytics), {
 				headers: {
 					'Content-Type': 'text/html; charset=utf-8',
 					'X-Content-Type-Options': 'nosniff',
@@ -564,14 +592,20 @@ export default async function handler(request) {
 			});
 		}
 
-		const modelMeta = `<meta name="x-model" content="${escapeHtml(res.modelUsed || 'unknown')}">`;
-		const readable = streamLLMResponse(res, null, ANALYTICS_SCRIPT, modelMeta);
+		const modelMeta = `<meta name="x-model" content="${escapeHtml(modelUsed || 'unknown')}">`;
+		const readable = streamLLMResponse(
+			res,
+			null,
+			analytics,
+			modelMeta,
+			waitUntil,
+		);
 		return new Response(readable, {
 			headers: {
 				'Content-Type': 'text/html; charset=utf-8',
 				'X-Content-Type-Options': 'nosniff',
 				'X-Powered-By': 'vibes',
-				'X-Model': res.modelUsed || 'unknown',
+				'X-Model': modelUsed || 'unknown',
 				...(failures.length
 					? { 'X-LLM-Failures': buildFailureSummary(failures) }
 					: {}),
