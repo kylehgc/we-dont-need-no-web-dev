@@ -8,9 +8,12 @@ const OPENROUTER_TIMEOUT_MS = 12000;
 // How long the winning model gets to produce its first token before we give up
 // and serve the emergency page instead of holding a headerless request open.
 const FIRST_BYTE_TIMEOUT_MS = 15000;
-// A lane of the model race opens this long after the previous one, unless the
-// previous lane has already failed outright (then the next opens immediately).
-const HEDGE_MS = 2000;
+// Delay before opening the next lane. Zero means every lane fires at once —
+// a true parallel race, first usable stream wins, which is what made the
+// original fast. Staggering was introduced to conserve the OpenRouter free
+// request quota, but that quota is not a constraint here and the stagger cost
+// seconds of latency on every page view. Raise it only if quota starts to bite.
+const HEDGE_MS = 0;
 // Once a stream is flowing, the longest gap tolerated between chunks. Free
 // models die mid-generation without closing the socket: the page freezes
 // half-written and the browser spins on "loading" forever. On idle we close
@@ -366,7 +369,11 @@ async function proveFirstToken(res, timeoutMs, looksUsable = () => true) {
 	const reader = res.body.getReader();
 	const chunks = [];
 	const decoder = new TextDecoder();
-	let text = '';
+	// Only the trailing partial line is carried between chunks. An earlier
+	// version kept the whole response in `text` and re-split it on every chunk,
+	// which made proving quadratic in CPU *and* re-counted the same tokens —
+	// four lanes doing that is what tripped Cloudflare's CPU limit.
+	let partial = '';
 	let content = '';
 	let watchdog;
 	const deadline = new Promise((r) => {
@@ -377,7 +384,7 @@ async function proveFirstToken(res, timeoutMs, looksUsable = () => true) {
 	// content. Keep-alive comment lines (": ...") never match. Also captures
 	// the real model slug, since openrouter/free hides it behind the router.
 	let servedBy = null;
-	const hasToken = (lines) => {
+	const scan = (lines) => {
 		for (const line of lines) {
 			const trimmed = line.trim();
 			if (!trimmed.startsWith('data: ') || trimmed === 'data: [DONE]')
@@ -426,14 +433,15 @@ async function proveFirstToken(res, timeoutMs, looksUsable = () => true) {
 				// Stream ended mid-proof. Flush the decoder and scan the final
 				// unterminated line too — a body whose only token has no trailing
 				// newline is still a proven body.
-				text += decoder.decode();
-				const final = hasToken(text.split('\n'));
+				const final = scan([partial + decoder.decode()]);
 				return final && looksUsable(final, true) ? provenBody() : null;
 			}
 
 			chunks.push(next.r.value);
-			text += decoder.decode(next.r.value, { stream: true });
-			const soFar = hasToken(text.split('\n').slice(0, -1));
+			partial += decoder.decode(next.r.value, { stream: true });
+			const lines = partial.split('\n');
+			partial = lines.pop() || '';
+			const soFar = scan(lines);
 			if (soFar) {
 				const verdict = looksUsable(soFar, false);
 				if (verdict === true) return provenBody();

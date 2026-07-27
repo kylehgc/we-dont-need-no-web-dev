@@ -252,6 +252,55 @@ await check('?key= authenticates and is stripped from the prompt; ?long= raises 
 	assert.match(userMsg, /vibe=maximal/);
 });
 
+await check('all lanes fire in parallel, first usable wins', async () => {
+	// Lane 0 stalls; a later lane answers immediately. With a true parallel
+	// race the page arrives in milliseconds, not after a stagger delay.
+	let call = 0;
+	globalThis.fetch = async () => {
+		call++;
+		if (call === 1) return new Response(new ReadableStream({ start() {} }), { status: 200 });
+		return new Response(sseStream(PAGE), { status: 200 });
+	};
+	const t0 = Date.now();
+	const c = ctx('https://x.dev/parallel', { ...KEY, FIRST_BYTE_TIMEOUT_MS: '5000' });
+	const html = await (await onRequest(c)).text();
+	await Promise.all(c.pending).catch(() => {});
+	const elapsed = Date.now() - t0;
+	assert.match(html, /<body>ok<\/body>/);
+	assert.ok(elapsed < 500, `lanes are serialized: took ${elapsed}ms for a page a parallel lane had ready`);
+});
+
+await check('proving is linear, not quadratic, in stream length', async () => {
+	// Guards the CPU regression that tripped Cloudflare's 1102 limit: proof
+	// used to re-split and re-parse the whole accumulated buffer per chunk.
+	// A long pre-content preamble must not blow up the work done.
+	const encoder = new TextEncoder();
+	const keepAlives = 4000;
+	globalThis.fetch = async () =>
+		new Response(
+			new ReadableStream({
+				start(controller) {
+					// Many chunks that carry no content — the quadratic version
+					// re-scanned every prior line for each of these.
+					for (let i = 0; i < keepAlives; i++) {
+						controller.enqueue(encoder.encode(': keep-alive\n'));
+					}
+					const payload = { choices: [{ delta: { content: '<html><head></head><body>fast</body></html>' } }] };
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n`));
+					controller.enqueue(encoder.encode('data: [DONE]\n'));
+					controller.close();
+				},
+			}),
+		);
+	const t0 = Date.now();
+	const c = ctx('https://x.dev/linear', KEY);
+	const html = await (await onRequest(c)).text();
+	await Promise.all(c.pending).catch(() => {});
+	const elapsed = Date.now() - t0;
+	assert.match(html, /<body>fast<\/body>/);
+	assert.ok(elapsed < 2000, `proving ${keepAlives} chunks took ${elapsed}ms — looks quadratic again`);
+});
+
 await check('fast models lead, router backstops the rot', async () => {
 	const calls = recordingFetch([
 		{ ok: false, status: 404 }, // pretend lane 0's slug was retired
